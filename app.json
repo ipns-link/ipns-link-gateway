@@ -1,0 +1,11 @@
+{
+  "name": "ipns-link",
+  "description": "Public IPFS http proxy",
+  "repository": "https://github.com/ipns-link/ipns-link-gateway",
+  "success_url": "/",
+  "buildpacks": [
+    {
+      "url": "https://github.com/ipns-link/ipns-link-gateway.git"
+    }
+  ]
+}

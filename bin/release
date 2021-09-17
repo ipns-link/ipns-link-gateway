@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Ref: https://www.oreilly.com/library/view/heroku-up-and/9781449341381/ch08.html
+# Ref: https://devcenter.heroku.com/articles/buildpack-api#bin-release
+
+cat << EOF
+---
+addons:
+config_vars:
+  PATH: "${PATH}:."
+default_process_types:
+  web: ipns-link-gateway
+EOF

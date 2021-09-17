@@ -1,0 +1,2 @@
+# Ignore files generated during testing
+.visitor_count.txt

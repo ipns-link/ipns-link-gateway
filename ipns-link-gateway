@@ -1,0 +1,226 @@
+#!/usr/bin/env -S bash -O extglob
+# Brief: Public IPFS http proxy
+# Repo: https://github.com/SomajitDey/ipns-link
+# Usage: PORT=<TCP port no.> MAX_CONNS=<max no. of simultaneous clients> ipns-link-gateway
+
+export IPFS_PATH="${IPFS_PATH:="${HOME}/.ipns-link-gateway"}"
+export cache_dir="${IPFS_PATH}/.cache"; mkdir -p "${cache_dir}"
+
+is_expired(){
+  # Brief: Check if given (cache) file is expired (exit code 0) or not (exit code 1).
+  # Usage: is_expired <path_to_cache_file> <ttl in seconds>
+  local file="${1}" ttl="${2}"
+  ((EPOCHSECONDS-"$(date -r "${file}" +%s)" > ttl))
+} &>/dev/null; export -f is_expired
+
+cache_address(){
+  # Brief: Cache multiaddress list.
+  # Usage: cache_address <ipns_key>
+  local ipns_key="${1}"
+  local cache_file="$(ls ${cache_dir}/*_${ipns_key}_*)"
+  if [[ -z "${cache_file}" ]] || is_expired "${cache_file}" 900; then
+    local multiaddress_list
+    multiaddress_list="$( # Gateways used to avoid using DHT, saving bandwidth. Multiple gateways for redundancy
+      set -o pipefail
+      (  
+        curl -sf --max-filesize 1000 https://ipfs.io/ipns/"${ipns_key}"/ || \
+        curl -sf --max-filesize 1000 https://gateway.ipfs.io/ipns/"${ipns_key}"/ || \
+        curl -sf --max-filesize 1000 https://cloudfare-ipfs.com/ipns/"${ipns_key}"/ || \
+        curl -sf --max-filesize 1000 https://gateway.pinata.cloud/ipns/"${ipns_key}"/ || \
+        curl -sf --max-filesize 1000 https://hub.textile.io/ipns/"${ipns_key}"/ || \
+        curl -sf --max-filesize 1000 https://ipfs.fleek.co/ipns/"${ipns_key}"/
+      ) | sed -n '/<!--ipns-link--/,/--ipns-link-->/{//!p;}'
+    )" || return 1
+    grep -v '/p2p/[[:alnum:]]*' <<< "${multiaddress_list}" && return 1 # Wrong pattern
+    local peerID="$(head -n1 <<< "${multiaddress_list}" | awk -F '/' '{print $NF}')"
+    # TODO: TBD: Does the following need to be atomic using flock?
+    if [[ -z "${cache_file}" ]]; then
+      if cache_file="$(ls ${cache_dir}/*_${peerID}_*)"; then
+        rm "${cache_file}"
+        cache_file="${cache_file}${ipns_key}_"
+      else
+        cache_file="${cache_dir}/_${peerID}_${ipns_key}_"
+      fi
+    fi
+    echo "${multiaddress_list}" > "${cache_file}"
+  fi
+} &>/dev/null; export -f cache_address
+
+get_peerID(){
+  # Brief: Get peerID corresponding to given ipns_key
+  # Usage: get_peerID <ipns_key>
+  [[ "$(ls ${cache_dir}/*_${1}_*)" =~ /_([[:alnum:]]+)_[^/]*$ ]] && echo "${BASH_REMATCH[1]}"
+} 2>/dev/null; export -f get_peerID
+
+connect(){
+  # Brief: Get multiaddress to the given node from cache and connect.
+  # Usage: connect <ipns_key or peerID>
+  local ipns_key="${1}"
+  local multiaddress
+  for multiaddress in $(cat ${cache_dir}/*_${ipns_key}_*); do
+    if ipfs swarm connect "${multiaddress}"; then
+      read peer_addr relay_addr < <(grep -o '/p2p/[[:alnum:]]*' <<< "${multiaddress}" | tac | xargs)
+      trap "disconnect ${peer_addr} ${relay_addr}" exit
+      break
+    else
+      false # To make the error code non-zero when swarm connect fails
+    fi
+  done
+} &>/dev/null; export -f connect
+
+disconnect(){
+  # Brief: Disconnect given peer and relay. Disconnect relay only if no other peer is using it
+  # Usage: disconnect </p2p/peer_addr> </p2p/relay_addr>
+  local peer_addr="${1}" relay_addr="${2}"
+  (
+    flock -F -n 3 || exit 1
+    ipfs swarm disconnect "${peer_addr}" # Disconnect from peer
+    if [[ -n "${relay_addr}" ]]; then
+      ipfs swarm peers | grep -q -m1 "${relay_addr}/p2p-circuit" || ipfs swarm disconnect "${relay_addr}"
+    fi
+  ) 3<${cache_dir}/*_${peer_addr/\/p2p\//}_*
+} &>/dev/null; export -f disconnect
+
+error(){
+  # Brief: Pass HTTP error to client. When no error, serve index.html, if any
+  # Usage: error [code] [reason-phrase/status]
+  local code="${1:-404}" msg="${2:-Not found}"
+  printf "%s\r\n" "HTTP/1.1 ${code} ${msg}"
+  printf "Content-Length: %d\r\n" "${#msg}"
+  printf "\r\n%s\r\n" "${msg}"
+  exit
+} 2>/dev/null; export -f error
+
+serve(){
+  # Brief: Serve resource/webpage at the given path
+  # Usage: serve <path>
+  local page="${1:-index.html}"
+  [[ -f "${page}" ]] || error
+  printf "%s\r\n" "HTTP/1.1 200 OK"
+  printf "Content-Length: %d\r\n" "$(wc -c "${page}" | cut -d' ' -f1)"
+  cat <(echo -e \\r) "${page}" <(echo -e \\r)
+  exit
+} 2>/dev/null; export -f serve
+
+redirect(){
+  # Brief: Pass HTTP redirect to client
+  # Usage: redirect <(relative) URL>
+  local url="${1}"
+  printf "%s\r\n" "HTTP/1.1 307 Temporary Redirect" # 307 makes sure Method and Body remain unchanged on redirect
+  printf "Cache-Control: %s\r\n" "no-store,max-age=0"
+  printf "Location: %s\r\n" "${url}"
+  local msg="<a href=${url}>Redirect</a>"
+  printf "Content-Length: %d\r\n" "${#msg}"
+  printf "\r\n%s\r\n" "${msg}"
+  exit
+} 2>/dev/null; export -f redirect
+
+rate_limiter(){
+  # Brief: Rate limiter
+  # Usage: rate_limiter <clientIP>
+  local allowed=20 interval=60 # Allowed n connections from any given IP per m seconds
+  local file="${cache_dir}/${1}_$((EPOCHSECONDS/interval))"
+  local count="$(wc -l "${file}" | cut -d' ' -f1)"
+  (( count < allowed )) && date +%D\ %H:%M:%S >> "${file}"
+} &>/dev/null; export -f rate_limiter
+
+visitor_count(){
+  # Brief: Log no. of users/visitors since server went up
+  # Usage: visitor_count
+  local log=./.visitor_count.txt
+  local count="Visitor-count: $(awk '{print $NF+1}' "${log}")"
+  flock -F "${log}" tee "${log}" <<< "${count}"
+} >&2; export -f visitor_count
+
+handler(){
+  # Brief: Main handler routine spawned by server on new connection from client.
+  # Usage: handler <ipfs_gateway_port>
+  rate_limiter "${SOCAT_PEERADDR}" || error 429 "Too many requests"
+  local method path version gateway_port="${1}"
+  read -rd $'\r\n' method path version && read # Reading the complete start-line
+  echo -e "\nLog: $(date +%D\ %H:%M:%S)\nIP: ${SOCAT_PEERADDR}\nMethod: ${method}\nPath: ${path}" >&2
+  if [[ "${path}" =~ ^/p2p/([[:alnum:]]+)/http(/.*)?$ ]]; then
+      [[ -n "${BASH_REMATCH[2]}" ]] || redirect "${path}/"
+    # Format 1: The path format that IPFS gateway works with. Every other format redirects to this
+      visitor_count
+      local ipns_key="${BASH_REMATCH[1]}"
+      cache_address "${ipns_key}" || error
+      # Cache destination used by current client
+      (flock 1; get_peerID "${ipns_key}") > "${cache_dir}/${SOCAT_PEERADDR}"
+      if flock -F -s 3 && connect "${ipns_key}"; then
+        cat <(printf "%s\r\n" "${method} ${path} ${version}") - | nc localhost "${gateway_port}"
+      else
+        error
+      fi 3<${cache_dir}/*_${ipns_key}_*
+  elif [[ "${path}" =~ ^/(ipns/|\?ipns-link-gateway=)([-[:alnum:].]+)((/|%2f|%2F).*)?$ ]]; then
+    # Format 2: Exists for user convenience. Redirect to format 1
+      local ipns_key="${BASH_REMATCH[2]}"
+      cache_address "${ipns_key}" || error
+      local peerID="$(get_peerID "${ipns_key}")"
+      # Cache destination used by current client
+      (flock 1; echo "${peerID}") > "${cache_dir}/${SOCAT_PEERADDR}"
+      redirect /p2p/"${peerID}"/http/"${BASH_REMATCH[3]#${BASH_REMATCH[4]}}"
+  elif [[ "${path}" =~ ^/(.visitor_count.txt)?$ ]]; then
+    # Brief: Serve pages from the gateway website for the filtered paths only
+      serve "${BASH_REMATCH[1]}"
+  else
+    # Format 3: Exists due to root-relative URLs in served websites. Path doesn't have ipns-name or peerID.
+    # Retrieve peerID from cache (i.e. last peerID requested by the current client) & redirect to format 1
+      local peerID="$((flock -s 0; cat -)<"${cache_dir}/${SOCAT_PEERADDR}" 2>/dev/null)"
+      if [[ -n "${peerID}" ]]; then
+        redirect /p2p/"${peerID}"/http"${path}"
+      else
+        error
+      fi
+  fi
+}; export -f handler
+
+init(){
+  # Brief: Launches daemon & gives gateway_port.
+  # Note: All ports are randomly chosen to allow multiple IPFS nodes on the same machine
+  if [[ "$(ipfs config App)" != "ipns-link-gateway" ]]; then
+    ipfs init --profile server || ipfs config profile apply server # Disallow local discovery & private IPs
+    ipfs bootstrap rm all
+    ipfs config Routing.Type none
+    ipfs config Swarm.ConnMgr.Type none
+    ipfs config --json Experimental.P2pHttpProxy true
+    ipfs config --json Gateway.PublicGateways '{"localhost": {"Paths":["/p2p"],"UseSubdomains": true}}'
+    ipfs config App ipns-link-gateway
+  fi
+  ipfs config profile apply randomports; rm -f "${IPFS_PATH}/config-pre-"*
+  pscan(){
+    # Brief: Give an unused, random, local TCP port except the one passed as argument
+    local port except="${1}"
+    while port="${RANDOM}";do # Max RANDOM=32767
+      ((port!=except)) || continue
+      nc -z localhost "${port}" || break
+    done
+    echo "${port}"
+  } 2>/dev/null; export -f pscan
+  RANDOM="${EPOCHSECONDS}" # Time dependent seed
+  local API_port="$(pscan)"; ipfs config Addresses.API "/ip4/127.0.0.1/tcp/${API_port}"
+  gateway_port="$(pscan "${API_port}")"; ipfs config Addresses.Gateway "/ip4/127.0.0.1/tcp/${gateway_port}"
+  [[ "$(ipfs daemon | grep -iom1 'Daemon is ready' & tail -f --pid=$! /dev/null)" ]] # Launcher
+} &>/dev/null; export -f init
+
+# Only execute functions defined above
+if [[ -n "${@}" ]]; then
+  "${@}"
+  exit "${?}"
+fi
+
+if init; then
+  echo "Status: Launched IPFS daemon. Gateway port: ${gateway_port}"
+else
+  echo "Error: Failed to launch IPFS daemon"
+  exit
+fi >&2
+
+server_port="${PORT:-8080}"; max_conns="${MAX_CONNS:-500}"
+: > ./.visitor_count.txt # TODO: Make this filename a global variable
+trap 'rm -rf ${cache_dir}/*' exit
+
+echo "Status: Listening for connections at port ${server_port} ..." >&2
+socat TCP4-LISTEN:"${server_port}",max-children="${max_conns}",fork,reuseaddr \
+  SYSTEM:"${BASH_SOURCE} handler ${gateway_port}"
+echo -e "\nStatus: Exiting ..." >&2

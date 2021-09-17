@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+
+build_dir="${1}" cache_dir="${2}"
+cache="${cache_dir}/go-ipfs/ipfs"
+if ! [[ -f "${cache}" ]]; then
+  (
+    cd "${cache_dir}"
+    echo "-----> Downloading go-ipfs v0.9.1"
+    wget https://dist.ipfs.io/go-ipfs/v0.9.1/go-ipfs_v0.9.1_linux-amd64.tar.gz || exit $?
+    echo "-----> Extracting ..."
+    tar -xzf go-ipfs_v0.9.1_linux-amd64.tar.gz
+  )
+fi && cp "${cache}" "${build_dir}" && chmod +x "${build_dir}/ipfs" && \
+  echo "-----> Installed go-ipfs v0.9.1"

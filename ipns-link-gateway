@@ -132,45 +132,95 @@ visitor_count(){
   flock -F "${log}" tee "${log}" <<< "${count}"
 } >&2; export -f visitor_count
 
+process_head(){
+  # Brief: Read the head part from the incoming http request from stdin and do the following:
+  ## Hold new headers in var "headers"
+  ## Set the "method", "path", "version", "host" and "referer" variables
+  ## Remove X-Forwarded-For to hide client IP
+  ## If there is no X-Forwarded-Host in the incoming request, set it to current host and X-Forwarded-Port to current port
+  ## Does DNSLink resolution. Sets the "inject_cookie_path" flag
+  read -rd $'\r\n' method path version && read # Reading the complete start-line
+  local input="$(sed -u '/^\r$/q')" # Load current headers, including the delimiting blank line
+  # "host" is current X-Forwarded-Host, assuming reverse proxies didn't preseve Host:
+  # If there is no X-Forwarded-Host currently, then retrieve "host" from Host:
+  local buffer
+  if ! host="$(set -o pipefail; grep -i -m1 '^X-Forwarded-Host:' <<< "${input}" | awk '{print $2}' | tr -d \\r)"; then
+    host="$(grep -i -m1 '^Host:' <<< "${input}" | awk '{print $NF}' | tr -d \\r)"
+    buffer="$(grep -vi '^X-Forwarded-Port:' <<< "${input}" | \
+    sed "3aX-Forwarded-Host: ${host%:*}\r\nX-Forwarded-Port: ${host##*:}\r")"
+  fi
+  # Put Host: localhost and delete X-Forwarded-For:
+  headers="$(sed '/^X-Forwarded-For:/Id; /^Host:/IcHost: localhost\r' <<< "${buffer:-"${input}"}")"
+  # The I modifer above (for case-insensitive regex) is for GNU sed only
+  # With referer-policy: strict-origin-when-cross-origin
+  # Read the /p2p/key/http part from the Referer header and store in the referer variable
+  local referer_header="$(grep -i -m1 '^Referer:' <<< "${input}")"
+  [[ "${referer_header}" =~ (http(s)?://[^/]+)(/p2p/[[:alnum:]]+/http) ]]
+  referer="${BASH_REMATCH[3]}"
+  # DNSLink
+  local peerID domain="${host%:*}" # domain is host without :port
+  if dig +short TXT _dnslink."${domain}" | grep -q -m1 'dnslink='; then
+    cache_address "${domain}" || redirect https://ipfs.io/ipns/"${domain}"
+    peerID="$(get_peerID "${domain}")"
+    path="/p2p/${peerID}/http${path}"
+    inject_cookie_path=false
+  else
+    inject_cookie_path=true
+  fi
+} >/dev/null; export -f process_head
+
+inject_response_headers(){
+  # Brief: Inject or modify certain headers in the http response message. Specifically the following
+  ## Put the /p2p/peerID/http prefix in cookie-path so that cookies are sent only to peerID
+  ## Remove Domain attribute from Set-Cookie header for Cross-origin safety. # TODO: TBD:
+  ## Enforce Referer-Policy such that Referer headers contain peerID - solves root-relative-URL problem.
+  # Usage: inject_response_headers <cookie_path>
+  local cookie_path="${1//\//\\\/}"
+  local input="$(sed -u '/^\r$/q')" # Load current headers, including the delimiting blank line
+  local buffer
+  if "${inject_cookie_path}"; then
+    buffer="$(sed "/^Set-Cookie:/I{s/Path=/Path=${cookie_path}/gi;s/Domain=[^;]*//gi}" <<< "${input}")"
+  fi
+  grep -v -i '^Referrer-Policy:' <<< "${buffer:-"${input}"}" | \
+    sed '3aReferrer-Policy: strict-origin-when-cross-origin\r'
+  cat # To pass on the response body
+}; export -f inject_response_headers
+
 handler(){
   # Brief: Main handler routine spawned by server on new connection from client.
   # Usage: handler <ipfs_gateway_port>
   rate_limiter "${SOCAT_PEERADDR}" || error 429 "Too many requests"
-  local method path version gateway_port="${1}"
-  read -rd $'\r\n' method path version && read # Reading the complete start-line
-  echo -e "\nLog: $(date +%D\ %H:%M:%S)\nIP: ${SOCAT_PEERADDR}\nMethod: ${method}\nPath: ${path}" >&2
+  local method path version headers host referer inject_cookie_path gateway_port="${1}"
+  process_head
+  echo -e "\nLog: $(date +%D\ %H:%M:%S)\nIP: ${SOCAT_PEERADDR}\nHost: ${host}\nMethod: ${method}\nPath: ${path}" >&2
+  echo "Referer: ${referer}" >&2
+  visitor_count
   if [[ "${path}" =~ ^/p2p/([[:alnum:]]+)/http(/.*)?$ ]]; then
       [[ -n "${BASH_REMATCH[2]}" ]] || redirect "${path}/"
     # Format 1: The path format that IPFS gateway works with. Every other format redirects to this
-      visitor_count
       local ipns_key="${BASH_REMATCH[1]}"
       cache_address "${ipns_key}" || error
-      # Cache destination used by current client
-      (flock 1; get_peerID "${ipns_key}") > "${cache_dir}/${SOCAT_PEERADDR}"
       if flock -F -s 3 && connect "${ipns_key}"; then
-        cat <(printf "%s\r\n" "${method} ${path} ${version}") - | nc localhost "${gateway_port}"
+        cat <(printf "%s\r\n%s\n" "${method} ${path} ${version}" "${headers}") - | \
+          nc -q 5 localhost "${gateway_port}" | \
+          inject_response_headers "/p2p/${ipns_key}/http"
+          # TODO: Why -q5 in `nc`. Conjures with -T30 in `socat` below. Without these timeouts connections are kept alive indefinitely.
       else
         error
       fi 3<${cache_dir}/*_${ipns_key}_*
   elif [[ "${path}" =~ ^/(ipns/|\?ipns-link-gateway=)([-[:alnum:].]+)((/|%2f|%2F).*)?$ ]]; then
     # Format 2: Exists for user convenience. Redirect to format 1
       local ipns_key="${BASH_REMATCH[2]}"
-      cache_address "${ipns_key}" || error
+      cache_address "${ipns_key}" || redirect https://ipfs.io/ipns/"${ipns_key}"
       local peerID="$(get_peerID "${ipns_key}")"
-      # Cache destination used by current client
-      (flock 1; echo "${peerID}") > "${cache_dir}/${SOCAT_PEERADDR}"
       redirect /p2p/"${peerID}"/http/"${BASH_REMATCH[3]#${BASH_REMATCH[4]}}"
-  elif [[ "${path}" =~ ^/(.visitor_count.txt)?$ ]]; then
-    # Brief: Serve pages from the gateway website for the filtered paths only
-      serve "${BASH_REMATCH[1]}"
   else
     # Format 3: Exists due to root-relative URLs in served websites. Path doesn't have ipns-name or peerID.
-    # Retrieve peerID from cache (i.e. last peerID requested by the current client) & redirect to format 1
-      local peerID="$((flock -s 0; cat -)<"${cache_dir}/${SOCAT_PEERADDR}" 2>/dev/null)"
-      if [[ -n "${peerID}" ]]; then
-        redirect /p2p/"${peerID}"/http"${path}"
+    # Retrieve peerID from Referer header (see "referer" above) & redirect to format 1
+      if [[ -n "${referer}" ]]; then
+        redirect "${referer}${path}"
       else
-        error
+        serve "${path#/}"
       fi
   fi
 }; export -f handler
@@ -184,7 +234,9 @@ init(){
     ipfs config Routing.Type none
     ipfs config Swarm.ConnMgr.Type none
     ipfs config --json Experimental.P2pHttpProxy true
-    ipfs config --json Gateway.PublicGateways '{"localhost": {"Paths":["/p2p"],"UseSubdomains": true}}'
+    ipfs config --json Gateway.NoFetch true
+    ipfs config --json Gateway.NoDNSLink true
+    ipfs config --json Gateway.PublicGateways '{"localhost": {"Paths":["/p2p"],"UseSubdomains": false}}'
     ipfs config App ipns-link-gateway
   fi
   ipfs config profile apply randomports; rm -f "${IPFS_PATH}/config-pre-"*
@@ -221,6 +273,6 @@ server_port="${PORT:-8080}"; max_conns="${MAX_CONNS:-500}"
 trap 'rm -rf ${cache_dir}/*' exit
 
 echo "Status: Listening for connections at port ${server_port} ..." >&2
-socat TCP4-LISTEN:"${server_port}",max-children="${max_conns}",fork,reuseaddr \
+socat -T30 TCP4-LISTEN:"${server_port}",max-children="${max_conns}",fork,reuseaddr \
   SYSTEM:"${BASH_SOURCE} handler ${gateway_port}"
 echo -e "\nStatus: Exiting ..." >&2

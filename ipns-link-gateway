@@ -146,8 +146,11 @@ process_head(){
   local buffer
   if ! host="$(set -o pipefail; grep -i -m1 '^X-Forwarded-Host:' <<< "${input}" | awk '{print $2}' | tr -d \\r)"; then
     host="$(grep -i -m1 '^Host:' <<< "${input}" | awk '{print $NF}' | tr -d \\r)"
+    # For X-Forwarded-Port, keep the header as is, if any; put port extracted from host otherwise
+    local fwd_port="$(awk '/^x-forwarded-port:/{print $2}' <<< "${input,,*}" | tr -d '\r')"
+    if [[ -z "${fwd_port}" ]]; then [[ "${host}" =~ :([0-9]+)$ ]] && fwd_port="${BASH_REMATCH[1]}";fi
     buffer="$(grep -vi '^X-Forwarded-Port:' <<< "${input}" | \
-    sed "3aX-Forwarded-Host: ${host%:*}\r\nX-Forwarded-Port: ${host##*:}\r")"
+    sed "3aX-Forwarded-Host: ${host%:*}\r\nX-Forwarded-Port: ${fwd_port}\r")"
   fi
   # Put Host: localhost and delete X-Forwarded-For:
   headers="$(sed '/^X-Forwarded-For:/Id; /^Host:/IcHost: localhost\r' <<< "${buffer:-"${input}"}")"

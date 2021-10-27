@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# This code is part of Heroku buildpack
+# This code installs the dependencies that don't exist on Heroku by default
+## persistently caching the downloaded binaries in cache_dir
+
+build_dir="${1}" cache_dir="${2}" # cache_dir persists between builds
+cached_ipfs="${cache_dir}/go-ipfs/ipfs"
+if ! [[ -f "${cached_ipfs}" ]]; then
+# Note: cached_ipfs can only exist if jq is cached too, because jq would be cached before it
+  (
+    cd "${cache_dir}"
+    echo "-----> Downloading jq v1.6"
+    wget https://github.com/stedolan/jq/releases/download/jq-1.6/jq-linux64 || exit $?
+    echo "-----> Downloading go-ipfs v0.10.0"
+    wget https://dist.ipfs.io/go-ipfs/v0.10.0/go-ipfs_v0.10.0_linux-amd64.tar.gz || exit $?
+    echo "-----> Extracting ..."
+    tar -xzf go-ipfs_v0.10.0_linux-amd64.tar.gz
+  )
+fi
+
+cd "${build_dir}"
+
+git init || exit 1 # Initialize git repo in the build_dir in case git is required by the app
+
+# Retrieve downloaded binaries from cache_dir
+cp "${cache_dir}/jq-linux64" bin/jq && chmod +x bin/jq && \
+  echo "-----> Installed jq v1.6" || exit 1
+cp "${cached_ipfs}" bin/ipfs && chmod +x bin/ipfs && \
+  echo "-----> Installed go-ipfs v0.10.0" || exit 1

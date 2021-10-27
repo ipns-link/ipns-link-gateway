@@ -1,0 +1,3 @@
+ipns-link-gateway linguist-language=bash
+app.json linguist-vendored
+bin/* linguist-vendored

@@ -1,0 +1,11 @@
+{
+  "name": "IPNS-Link-Gateway",
+  "description": "Portal to dynamic sites exposed with IPNS-Link",
+  "repository": "https://github.com/ipns-link/ipns-link-gateway",
+  "success_url": "/",
+  "buildpacks": [
+    {
+      "url": "https://github.com/ipns-link/ipns-link-gateway.git"
+    }
+  ]
+}

@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# This code is part of Heroku buildpack
+
+[[ -x "${1}/ipns-link-gateway" ]]

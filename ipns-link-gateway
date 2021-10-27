@@ -1,0 +1,449 @@
+#!/usr/bin/env -S bash -O extglob
+export LANGUAGE=C LANG=C LC_ALL=C
+export PATH=bin:"${HOME}"/.bin:"${PATH}"
+
+usage(){
+  echo "
+Brief: Locally host an IPNS-Link-Gateway
+Repo: https://github.com/ipns-link
+Synopsis: ipns-link-gateway [options] [<URL>]
+Options:
+  -p <TCP port no. gateway listens at> # Default: 8080
+  -m <max no. of concurrent connections> # Default: 500
+  -r <no. of requests allowed per minute> # Default: 120
+  -v # Version
+  -h # Usage / Help
+Example: ipns-link-gateway # Uses the default URL http://localhost:8080
+Example: ipns-link-gateway -p \$PORT \$URL
+" 
+} >&2; export -f usage
+
+export version=1.0.0
+export IPFS_PATH="${PWD}/.ipfs"
+export cache_dir="${IPFS_PATH}/.cache"
+export GNUPGHOME="${IPFS_PATH}/.gpg"
+export sockets="${IPFS_PATH}/.sockets"
+export pid_file="${IPFS_PATH}/.pid"
+export ipfs_subd_gw="https://cf-ipfs.com" # For redirects
+export ipfs_path_gw="https://gateway.pinata.cloud" # For direct downloads
+
+is_expired(){
+  # Brief: Check if a given cache-file is expired (exit code 0) or not (exit code 1).
+  # Usage: is_expired <path to cache-file> [<ttl in seconds>]
+  # Default: ttl=1d
+  local file="${1}" ttl="${2:-86400}"
+  [[ -f "${file}" ]] || return 0
+  ((EPOCHSECONDS-"$(date -r "${file}" +%s)" > ttl))
+} &>/dev/null; export -f is_expired
+
+b36_peerID(){
+  # Brief: Convert any IPNS name/DNSLink/KeyID to base36 peerID (codec=libp2p-key)
+  # Usage: b36_peerID <name>, or, echo <name> | base36
+  # TODO: Resolve .ipns names
+  local gateway_sock="${sockets}/gateway" name="${1:-"$(head -n1)"}"
+  [[ "${name##*/}" == *([[:alnum:]]) ]] || name="$(ipfs dns --recursive=false "${name##*/}" | grep -m1 '^/ipns/')" || return 1
+  curl -I --unix-socket "${gateway_sock}" forBase36/p2p/"${name##*/}" | \
+    sed -n '/^Location:/s/.*\/\([a-z0-9]*\).p2p..*/\1/p'
+} 2>/dev/null; export -f b36_peerID
+
+key_val(){
+  # Brief: Access value for given JSON key for given peerID (base36, codec=libp2p-key)
+  # Usage: key_val <key> <peerID>
+  local key="${1#.}" peerID="${2}"
+  jq -er ".${key}|values" "${cache_dir}/${peerID}"
+} 2>/dev/null; export -f key_val
+
+inject_conn_close(){
+  # Brief: Inject "Connection: close" header while filtering/piping http request/response through
+  sed -u '/^\r$/q' | sed -u '/^Connection:/Id' | sed -u '1aConnection: close\r';cat
+}; export -f inject_conn_close
+
+p2p_stream(){
+  # Brief: Establish bi-directional p2p stream with given peerID (base36, codec=libp2p-key)
+  local peerID="${1}"
+  # Note: Socket filename must be <=40 characters, whereas peerID is longer
+  # So transfer the peerID to base64 and then take last 32 (base64) characters
+  local b64_peerID="$(ipfs cid format -b base64 <<< "${peerID}")"; b64_peerID="${b64_peerID//\//-}"
+  local short_alias="${b64_peerID: -32:32}"
+  local usock="${sockets}/${short_alias}" # Unix socket
+  local nodeID="$(key_val multiaddress.ID "${peerID}")"
+  [[ -S "${usock}" ]] || ipfs p2p forward /x/ipns-link/"${peerID}" /unix/"${usock#/}" /p2p/"${nodeID}"
+  inject_conn_close | socat STDIO UNIX-CLIENT:"${usock}" | inject_conn_close
+  # Allowing persistent connections might forward even cache requests to Origin-server. Hence the injection.
+}; export -f p2p_stream
+
+ranpick(){
+  # Brief: Pick a word randomly from stdin
+  local input
+  read -a input
+  local size="${#input[@]}"
+  echo "${input[RANDOM%size]}"
+} < <(xargs) 2>/dev/null; export -f ranpick
+
+cache_manifest(){
+  # Brief: Cache Manifest. Fail if no manifest is found. Emit trusted gateway URL if fail to decrypt.
+  # Usage: cache_manifest [-f] <peerID> # -f means force - i.e. regardless of expiry
+  local OPTIND=1 opt refresh=false
+  getopts f opt; [[ "${opt}" == f ]] && refresh=true
+  local peerID="${!OPTIND}"
+  local manifest="${cache_dir}/${peerID}"
+  if is_expired "${manifest}" || "${refresh}"; then
+    "${refresh}" || rm -f "${manifest}"
+    local block="$( if ipfs_path="$(ipfs name resolve --nocache --dhtt=3s "${peerID}")"; then
+                      ipfs cat "${ipfs_path}/index.html"
+                    else
+                      curl -sfLo- "${ipfs_path_gw}/ipns/${peerID}/index.html"
+                    fi | sed -n '/<!--ipns-link--/,/--ipns-link-->/{//!p;}' )"
+    [[ -n "${block}" ]] || return 1 # PeerID not using IPNS-Link
+    local tmpfile="$(mktemp -p "${cache_dir}")"; trap "rm -f ${tmpfile}" return
+    (head -n1 <<< "${block}" | ipfs multibase decode | \
+      gpg --batch -q --passphrase "ipns-link" --pinentry-mode loopback -d > "${tmpfile}") && \
+        mv "${tmpfile}" "${manifest}" || \
+          (tail -n+2 <<< "${block}" | ranpick)
+  fi
+} 2>/dev/null; export -f cache_manifest
+
+connect(){
+  # Brief: Get multiaddress to the Origin-server from Manifest and connect. Also add to peering subsystem.
+  # Usage: connect <peerID>
+  local peerID="${1}" route
+  local nodeID="$(key_val multiaddress.ID "${peerID}")"
+  connect_and_peer(){
+    # Brief: Just a small utility
+    local multiaddress="${1}"
+    if timeout 10 ipfs swarm connect "${multiaddress}"; then
+      ipfs swarm peering add "${multiaddress}"
+      return 0
+    else
+      return 1
+    fi
+  } &>/dev/null
+  # Check if already connected
+  ipfs swarm peers | grep -q -m1 "/p2p/${nodeID}$" && return 0
+  # First, choose a multiaddress at random - this distributes the load between different routes
+  route="$(key_val multiaddress.route[] "${peerID}" | ranpick)"
+  connect_and_peer "${route}/p2p/${nodeID}" && return 0
+  # Failure means probably the dynamic address / relay changed; so refresh manifest
+  cache_manifest -f "${peerID}"; nodeID="$(key_val multiaddress.ID "${peerID}")"
+  # This time, try every route. Note we are doing this regardless of whether manifest was refreshed or not
+  for route in $(key_val multiaddress.route[] "${peerID}"); do
+    connect_and_peer "${route}/p2p/${nodeID}" && return 0
+  done
+} &>/dev/null; export -f connect
+
+rate_limiter(){
+  # Brief: Rate limiter
+  # Usage: rate_limiter <clientIP>
+  local allowed="${req_per_min}" interval=60 # Allowed n connections from any given IP per m seconds interval
+  local register="${cache_dir}/${1}"
+  local count="$((flock -s 0 && wc -l) < "${register}")" # Read lock on register
+  local epoch="$((EPOCHSECONDS/interval))"
+  if flock 3 && grep "${epoch}" "${register}"; then # Write lock on register
+    (( count < allowed )) && echo "${epoch}" >> "${register}"
+  else
+    echo "${epoch}" > "${register}"
+  fi 3>>"${register}"
+} &>/dev/null; export -f rate_limiter
+
+error(){
+  # Brief: Pass HTTP error to client
+  # Usage: error [<code>] [<reason-phrase>/<status>]
+  local code="${1:-404}" msg="${2:-Not found}"
+  printf "%s\r\n" "HTTP/1.1 ${code} ${msg}"
+  printf "Connection: %s\r\n" "close"
+  printf "Content-Length: %d\r\n" "${#msg}"
+  printf "\r\n%s" "${msg}"
+  exit
+} 2>/dev/null; export -f error
+
+redirect(){
+  # Brief: Pass HTTP redirect to client
+  # Usage: redirect <(relative) URL> <code> <phrase>
+  # Default response code: 307; this makes sure Method and Body remain unchanged on redirect
+  local url="${1}" code="${2:-307}" phrase="${3:- Temporary Redirect}"
+  printf "%s\r\n" "HTTP/1.1 ${code} ${phrase}"
+  printf "Connection: %s\r\n" "close"
+  printf "Cache-Control: %s\r\n" "no-store,max-age=0"
+  printf "Location: %s\r\n" "${url}"
+  local msg="<a href=${url}>Redirect</a>"
+  printf "Content-Length: %d\r\n" "${#msg}"
+  printf "\r\n%s" "${msg}"
+  exit
+} 2>/dev/null; export -f redirect
+
+read_req_head(){
+  # Brief: Read the head part from the incoming http request from stdin and do the following:
+  ## Remove X-Forwarded-For header, if any, to hide client IP
+  ## Hold new headers, except start-line, in the variable "headers"
+  ## Set the "method", "path", "version", "host", "port", "proto" variables
+  read -rd $'\r\n' method path version && read # Reading the complete start-line
+  # Load current headers, including the delimiting blank line. Note: sed -u to make things unbuffered
+  headers="$(sed -u '/^\r$/q' | sed -u '/^X-Forwarded-For:/Id')"
+  # "host" is retrieved preferably from the X-Forwarded-Host header; the Host header otherwise
+  local x_fwd_host="$(grep -i -m1 '^X-Forwarded-Host:' <<< "${headers}" | tr -d \\r | tr ',' ' ' | awk 'NF {print $2}')"
+  local x_fwd_proto="$(grep -i -m1 '^X-Forwarded-Proto:' <<< "${headers}" | tr -d \\r | tr ',' ' ' | awk 'NF {print $2}')"
+  local x_fwd_port="$(grep -i -m1 '^X-Forwarded-Port:' <<< "${headers}" | tr -d \\r | tr ',' ' ' | awk 'NF {print ":"$2}')"
+  local hostname="$(grep -i -m1 '^Host:' <<< "${headers}" | tr -d \\r | awk 'NF {print $NF}')"
+  host="${x_fwd_host:-"${hostname%:*}"}"
+  port="${x_fwd_port:-"$(grep -o ':[[:digit:]]*$'<<< "${hostname}")"}"
+  proto="${x_fwd_proto:-http}"
+  [[ "${proto}" == http ]] && [[ "${port}" == :80 ]] && port=
+  [[ "${proto}" == https ]] && [[ "${port}" == :443 ]] && port=
+} &>/dev/null; export -f read_req_head
+
+serve(){
+  # Brief: Serve resource/webpage at the given path
+  # Usage: serve [<path> | <(cmd) | <named-pipe>]
+  [[ "${method}" == @(GET|HEAD) ]] || error 405 "Method Not Allowed"
+  local page="${1:-index.html}"
+  [[ -f "${page}" ]] || error
+  printf "%s\r\n" "HTTP/1.1 200 OK"
+  printf "Connection: %s\r\n" "close"
+  printf "Content-Length: %d\r\n\r\n" "$(wc -c < "${page}")"
+  [[ "${method}" == HEAD ]] || cat "${page}"
+  exit
+} 2>/dev/null; export -f serve
+
+forward(){
+  # Brief: Proxy to Origin-server, serve from IPFS or redirect to IPFS gateway
+  # Usage: forward <peerID | dnslink>
+  
+  # Handle content-addressed IPFS or IPNS paths
+  [[ "${method}" == GET ]] && [[ "${path}" =~ ^/ipfs/* ]] && redirect "${ipfs_subd_gw}${path}"
+  [[ "${path}" =~ ^/ipns/* ]] && redirect "${gateway_url}${path}"
+
+  # Handle failure to download/decrypt Manifest and DNSLinks that resolve to IPFS paths
+  local peerID="$(b36_peerID "${1}")" trusted_gw
+  [[ -n "${peerID}" ]] || redirect "${ipfs_subd_gw}/ipns/${1}${path}" 303 "See Other"
+  trusted_gw="$(cache_manifest "${peerID}")" || redirect "${ipfs_subd_gw}/ipns/${peerID}${path}" 303 "See Other"
+  [[ -z "${trusted_gw}" ]] || redirect "${trusted_gw}/ipns/${peerID}${path}"
+
+  local etag_header="$(grep -im1 '^If-None-Match: ' <<< "${headers}")"; etag_header="${etag_header%$'\r'}"
+
+  # Handle static cache hosted on IPFS
+  local cache_path cache_cid
+  if [[ "${method}" == GET ]] && \
+    cache_path="$(key_val cache.path ${peerID})" && cache_cid="$(key_val cache.CID ${peerID})" && \
+    [[ "${path}" =~ ^"${cache_path}" ]]; then
+      local ipfs_path="/ipfs/${cache_cid}/${path#${cache_path}}"
+      # Use cloudflare's gateway for speed/caching by all IPNS-Link-Gateways; Fallback to local gateway on failure
+      { curl --http1.1 -H "${etag_header}" -Nsfio- "${ipfs_path_gw}/${ipfs_path}" || \
+        curl --http1.1 -H "${etag_header}" -Nsio- --unix-socket "${sockets}/gateway" localhost/"${ipfs_path#/}";} | \
+          inject_conn_close
+      exit # Close connection
+  fi
+  
+  # Handle failure to connect
+  local on_fail
+  connect "${peerID}" || \
+    if on_fail="$(key_val on_fail ${peerID})"; then
+      redirect "${on_fail}"
+    else
+      error
+    fi
+
+  # Handle streams / dynamic cache using ipns-path. Pass if there's no link at the ipns-path
+  local stream_path stream_kid
+  if [[ "${method}" == GET ]] && \
+    stream_path="$(key_val stream.path ${peerID})" && stream_kid="$(key_val stream.keyID ${peerID})" && \
+    [[ "${path}" =~ ^"${stream_path}" ]]; then
+    local ipns_path="/ipns/${stream_kid}/${path#${stream_path}}"
+    (ipfs ls "${ipns_path}" || ipfs name resolve --nocache --dhtt=1s "${stream_kid}")&>/dev/null || error
+    curl --http1.1 -H "${etag_header}" -Nsio- --unix-socket "${sockets}/gateway" localhost/"${ipns_path#/}" | inject_conn_close
+    exit # Close connection
+  fi
+
+  ( # Forward to Origin-server after Host header modification
+    printf "%s\r\n" "${method} ${path} ${version}"
+    configured_host="$(key_val host ${peerID})"
+    sed -u "/^Host:/IcHost: ${configured_host:- ${peerID}}\r" <<< "${headers}"
+    cat
+  ) | p2p_stream "${peerID}"
+}; export -f forward
+
+handler(){
+  # Brief: Main handler routine spawned by server on new connection from client.
+  local ipfs_pid; read -u3 ipfs_pid
+  trap "flock -u 3 ; flock -n ${pid_file} -c 'kill -STOP ${ipfs_pid}'" exit # Reason for flock -n: If failed to lock, the running handler will pause on exit
+  flock -s 3 && kill -CONT "${ipfs_pid}" # Resume ipfs after acquiring shared lock
+  rate_limiter "${SOCAT_PEERADDR}" || error 429 "Too many requests"
+  local method path version headers host port proto
+  read_req_head
+  flock -F . echo -e "\nLog: $(date +%D\ %H:%M:%S)\nIP: ${SOCAT_PEERADDR}\nHost: ${proto}://${host}${port}\nMethod: ${method}\nPath: ${path}" >&2 & # Non-blocking
+  if [[ "${host}" == @(www."${gateway_host}"|"${gateway_host}") ]]; then
+    if [[ "${path}" =~ ^/(ipns/|\?ipns-link-gateway=)([-[:alnum:].]+)((/|%2f|%2F).*)?$ ]]; then
+      local peerID="$(b36_peerID "${BASH_REMATCH[2]}")"
+      local fwd_path="${BASH_REMATCH[3]//${BASH_REMATCH[4]}/\/}"
+      [[ -n "${peerID}" ]] || redirect "${ipfs_subd_gw}/ipns/${BASH_REMATCH[2]}${fwd_path}" 303 "See Other"
+      redirect "${proto}://${peerID}.ipns.${gateway_host}${port}${fwd_path}"
+    elif [[ "${path}" =~ ^/ipfs/* ]]; then
+      redirect "${ipfs_subd_gw}${path}" 303 "See Other"
+    else
+      serve "${path#/}"
+    fi      
+  elif [[ "${host}" =~ ^([-a-z0-9]*).ipns."${gateway_host}"$ ]]; then
+    local subdomain="${BASH_REMATCH[1]}"
+    # my--site-com should be transformed to my-site.com
+    subdomain="${subdomain//--/_}"; subdomain="${subdomain//-/.}"; subdomain="${subdomain//_/-}"
+    forward "${subdomain}"
+  elif [[ "${host}" =~ ^([a-z0-9]*).ipfs."${gateway_host}"$ ]]; then
+    redirect "${ipfs_subd_gw}/ipfs/${BASH_REMATCH[1]}${path}" 303 "See Other"
+  elif [[ "${host}" =~ ^[-[:alnum:].]+$ ]]; then
+    forward "${host}"
+  fi  
+} 3<"${pid_file}"; export -f handler
+
+init(){
+  # Brief: Launches daemon
+  # Note: TCP ports are randomly chosen to allow multiple IPFS nodes on the same machine
+  if [[ "$(ipfs config App)" != "ipns-link-gatewayV${version}" ]]; then
+    ipfs init --profile server || ipfs config profile apply server # Disallow local discovery & private IPs
+    ipfs config --json Experimental.Libp2pStreamMounting true
+    ipfs config --json Experimental.P2pHttpProxy true
+    ipfs config Reprovider.Strategy roots
+    ipfs config Routing.Type dhtclient
+    ipfs config Swarm.ConnMgr.Type basic
+    ipfs config Swarm.ConnMgr.GracePeriod 5s
+    ipfs config --json Swarm.ConnMgr.LowWater 0
+    ipfs config --json Swarm.ConnMgr.HighWater 2
+    ipfs config --bool Swarm.EnableRelayHop false
+    ipfs config --bool Swarm.DisableNatPortMap true
+    ipfs config --bool Swarm.EnableAutoRelay false
+    ipfs config AutoNAT.ServiceMode disabled
+    # Ref: https://docs.ipfs.io/how-to/peering-with-content-providers/#content-provider-list
+    ipfs config --json Peering.Peers '[
+      {"ID":"QmcfgsJsMtx6qJb74akCw1M24X1zFwgGo11h1cuhwQjtJP"},
+      {"ID":"QmWaik1eJcGHq1ybTWe7sezRfqKNcDRNkeBaLnGwQJz1Cj"},
+      {"ID":"QmNfpLrQQZr5Ns9FAJKpyzgnDL2GgC6xBug1yUZozKFgu4"},
+      {"ID":"QmPo1ygpngghu5it8u4Mr3ym6SEU2Wp2wA66Z91Y1S1g29"},
+      {"ID":"QmRjLSisUCHVpFa5ELVvX3qVPfdxajxWJEHs9kN3EcxAW6"},
+      {"ID":"QmPySsdmbczdZYBpbi2oq2WMJ8ErbfxtkG8Mo192UHkfGP"},
+      {"ID":"QmSarArpxemsPESa6FNkmuu9iSE1QWqPX2R3Aw6f5jq4D5"},
+      {"ID":"QmUEMvxS2e7iDrereVYc5SWPauXPyNwxcy9BXZrC1QTcHE"},
+      {"ID":"QmNSYxZAiJHeLdkBg38roksAR9So7Y5eojks1yjEcUtZ7i"},
+      {"ID":"QmUd6zHcbkbcs7SMxwLs48qZVX3vpcM8errYS7xEczwRMA"},
+      {"ID":"QmbVWZQhCGrS7DhgLqWbgvdmKN7JueKCREVanfnVpgyq8x"},
+      {"ID":"QmdnXwLrC8p1ueiq2Qya8joNvk3TVVDAut7PrikmZwubtR"},
+      {"ID":"12D3KooWCRscMgHgEo3ojm8ovzheydpvTEqsDtq7Vby38cMHrYjt"},
+      {"ID":"12D3KooWQtpvNvUYFzAo1cRYkydgk15JrMSHp6B6oujqgYSnvsVm"},
+      {"ID":"12D3KooWQcgCwNCTYkyLXXQSZuL5ry1TzpM8PRe9dKddfsk1BxXZ"}
+      ]'
+    ipfs config --json Gateway.PublicGateways '{
+      "forBase36": {"NoDNSLink":true,"Paths":["/p2p"],"UseSubdomains": true},
+      "localhost": {"NoDNSLink":false,"Paths":["/ipfs","/ipns"],"UseSubdomains": false}
+      }'
+    ipfs config --json Gateway.HTTPHeaders.Access-Control-Allow-Methods '["GET", "PUT", "POST", "HEAD", "DELETE", "PATCH", "OPTIONS"]'
+    mkdir -p "${sockets}" "${cache_dir}"
+    ipfs config Addresses.API "/unix/${sockets}/api"
+    ipfs config Addresses.Gateway "/unix/${sockets}/gateway"
+    rm -rf "${GNUPGHOME}" ; mkdir -p "${GNUPGHOME}"
+    gpg --batch -q --gen-key << EOF
+  %no-protection
+  Key-Type: EDDSA
+    Key-Curve: ed25519
+  Subkey-Type: ECDH
+    Subkey-Curve: cv25519
+  Name-Real: ${gateway_host}
+  Expire-Date: 0
+EOF
+    (($? == 0)) && gpg --export -a > pubkey || return 1
+    ipfs config App "ipns-link-gatewayV${version}"
+  fi
+  ipfs config profile apply randomports; rm -f "${IPFS_PATH}/config-pre-"*
+  (ipfs swarm peers || rm -f "${sockets}"/*) # Otherwise API and Gateway won't bind to existing UNIX socket
+  [[ "$((ipfs daemon --enable-namesys-pubsub --enable-gc & echo $! > "${pid_file}") | grep -iom1 'Daemon is ready' & tail -f --pid=$! /dev/null)" ]] || return 1 # Launcher
+} &>/dev/null; export -f init
+
+main(){
+  # Brief: The main driver
+  export gateway_port=8080 max_conns=500 req_per_min=120 # Defaults
+  local OPTIND=1 opt
+  while getopts p:m:r:c:vh opt; do
+    case "${opt}" in
+      p) gateway_port="${OPTARG}";;
+      m) max_conns="${OPTARG}";;
+      r) req_per_min="${OPTARG}";;
+      c) eval "${OPTARG}"; exit $?;;
+      v) echo "${version}"; exit;;
+      h | *) usage; exit 1;;
+    esac
+  done
+  local arg="${!OPTIND:-http://localhost:8080}"
+  if [[ "${arg}" =~ ^(http|https)://([-[:alnum:].]+)(:[[:digit:]]+)?$ ]]; then
+    export gateway_url="${arg}"
+    export gateway_host="${BASH_REMATCH[2]}"
+  else
+    echo "Provide gateway-URL of the form http(s)://fully.qualified.domain(:port)" >&2
+    usage; exit 1
+  fi
+
+  if (( "${gateway_port}" < 1024 )) && ((EUID != 0)); then
+    echo "Error: Please run as root, using sudo" >&2; exit 1
+  fi
+
+  if init; then
+    echo "Status: Launched IPFS daemon"
+    kill -STOP "$(<"${pid_file}")"
+    trap "kill -CONT $(<"${pid_file}"); ipfs shutdown; gpgconf --kill gpg-agent" exit # This is trap for global exit; not `handler` exit
+  else
+    echo "Error: Failed to launch IPFS daemon"
+    exit 1
+  fi >&2
+
+  echo "Status: Listening for connections at port=${gateway_port} with URL=${gateway_url} ..." >&2
+  socat -T60 TCP-LISTEN:"${gateway_port}",max-children="${max_conns}",fork,reuseaddr \
+    SYSTEM:"${BASH_SOURCE} -c handler"
+  echo -e "\nStatus: Exiting ..." >&2
+}
+
+dep_check(){
+  # Brief: Check major dependencies
+  local ipfs_version quit
+  if ipfs_version=$(ipfs version --number 2>/dev/null); then
+    local req_ipfs_ver=0.10.0 # Minimum ipfs-cli version required
+    [[ "$(echo -e "${ipfs_version}\n${req_ipfs_ver}" | sort -V | head -n1)" == "${req_ipfs_ver}" ]] || \
+      { echo -e "Required: go-ipfs-cli version >= ${req_ipfs_ver}\nSuggestion: ipfs update install latest\n"; quit="yes";}
+  else
+    echo -e "Required: go-ipfs-cli\nSource: https://docs.ipfs.io/install/command-line/#linux\n"
+    quit="yes"
+  fi
+  if ! command -v curl &>/dev/null; then
+    echo -e "Required: curl\nSource: Native package repository"
+    echo -e "Ref: https://command-not-found.com/curl\n"
+    quit="yes"
+  fi
+  if ! command -v socat &>/dev/null; then
+    echo -e "Required: socat\nSource: Native package repository"
+    echo -e "Ref: https://command-not-found.com/socat\n"
+    quit="yes"
+  fi
+  if ! command -v gpg &>/dev/null; then
+    echo -e "Required: gpg\nSource: Native package repository"
+    echo -e "Ref: https://command-not-found.com/gpg\n"
+    quit="yes"
+  fi
+  if ! command -v jq &>/dev/null; then
+    echo -e "Required: jq\nSource: Native package repository"
+    echo -e "Ref: https://stedolan.github.io/jq/download/\n"
+    quit="yes"
+  fi
+  [[ -v quit ]] && echo "NOTE: The dependencies may also be installed locally at ./bin" && exit 1
+} >&2
+
+report_updates(){
+  # Brief: Report if updates are available
+  local latest api_url="https://api.github.com/repos/ipns-link/ipns-link-gateway/tags"
+  if latest="$(timeout 1 curl -sfNLo- "${api_url}" | jq -r .[].name | grep -m1 '^v')"; then
+    local current="v${version}"
+    [[ "${current}" != "${latest}" ]] && echo "Updates available: ${current} -> ${latest}"
+  fi
+} >&2 2>/dev/null
+
+(git check-ignore -q ".ipfs" && git check-ignore -q "pubkey")&>/dev/null || \
+  { echo "Must be run from the original git-repo that you git-cloned" >&2; exit 1;}
+
+dep_check
+
+report_updates
+
+main "${@}"

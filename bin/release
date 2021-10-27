@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Ref: https://www.oreilly.com/library/view/heroku-up-and/9781449341381/ch08.html
+# Ref: https://devcenter.heroku.com/articles/buildpack-api#bin-release
+# This code is part of Heroku buildpack
+
+cat << EOF
+---
+addons:
+config_vars:
+  URL: http://ipns-link-trial.herokuapp.com
+default_process_types:
+EOF

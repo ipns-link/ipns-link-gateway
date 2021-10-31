@@ -1,1 +1,1 @@
-web: ./ipns-link-gateway -p $PORT $URL
+web: ./ipns-link-gateway -a $Password -p $PORT $URL

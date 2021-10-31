@@ -1,3 +1,4 @@
 # Ignore runtime files
 pubkey
 .ipfs
+?admin_pass=*

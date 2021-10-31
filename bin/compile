@@ -2,8 +2,9 @@
 # This code is part of Heroku buildpack
 # This code installs the dependencies that don't exist on Heroku by default
 ## persistently caching the downloaded binaries in cache_dir
+## Repurposed to be used with AWS EC2 with AMI=Ubuntu-20.04-amd64
 
-build_dir="${1}" cache_dir="${2}" # cache_dir persists between builds
+build_dir="${1:-.}" cache_dir="${2:-/tmp}" # cache_dir persists between builds
 cached_ipfs="${cache_dir}/go-ipfs/ipfs"
 if ! [[ -f "${cached_ipfs}" ]]; then
 # Note: cached_ipfs can only exist if jq is cached too, because jq would be cached before it

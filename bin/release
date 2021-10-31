@@ -8,5 +8,6 @@ cat << EOF
 addons:
 config_vars:
   URL: http://ipns-link-trial.herokuapp.com
+  Password: admin
 default_process_types:
 EOF

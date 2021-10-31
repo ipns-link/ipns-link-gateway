@@ -18,14 +18,24 @@ Example: ipns-link-gateway -p \$PORT \$URL
 " 
 } >&2; export -f usage
 
-export version=1.0.0
+export version=1.0.1
 export IPFS_PATH="${PWD}/.ipfs"
 export cache_dir="${IPFS_PATH}/.cache"
 export GNUPGHOME="${IPFS_PATH}/.gpg"
 export sockets="${IPFS_PATH}/.sockets"
 export pid_file="${IPFS_PATH}/.pid"
 export ipfs_subd_gw="https://cf-ipfs.com" # For redirects
-export ipfs_path_gw="https://gateway.pinata.cloud" # For direct downloads
+export ipfs_path_gw="https://ipfs.io" # For direct downloads
+
+kill_proc_tree(){
+  # Brief: Kill (with SIGKILL) all descendants of the process id given, with the given signal, if any
+  # Usage: kill_proc_tree <pid> [<SIG>] # Default SIG=KILL
+  local pid
+  for pid in $(pgrep -P "${1}"); do
+    kill_proc_tree "${pid}" "${2}" &
+  done
+  kill -CONT "${1}"; kill -"${2:-KILL}" "${1}" 
+} &>/dev/null; export -f kill_proc_tree
 
 is_expired(){
   # Brief: Check if a given cache-file is expired (exit code 0) or not (exit code 1).
@@ -68,17 +78,18 @@ p2p_stream(){
   local usock="${sockets}/${short_alias}" # Unix socket
   local nodeID="$(key_val multiaddress.ID "${peerID}")"
   [[ -S "${usock}" ]] || ipfs p2p forward /x/ipns-link/"${peerID}" /unix/"${usock#/}" /p2p/"${nodeID}"
-  inject_conn_close | socat STDIO UNIX-CLIENT:"${usock}" | inject_conn_close
+  inject_conn_close | socat -T10 STDIO UNIX-CLIENT:"${usock}" | inject_conn_close
   # Allowing persistent connections might forward even cache requests to Origin-server. Hence the injection.
+  exit
 }; export -f p2p_stream
 
 ranpick(){
-  # Brief: Pick a word randomly from stdin
+  # Brief: Pick a word randomly from stdin. For empty input return 1.
   local input
-  read -a input
+  read -a input || return 1
   local size="${#input[@]}"
   echo "${input[RANDOM%size]}"
-} < <(xargs) 2>/dev/null; export -f ranpick
+} < <(xargs -r) 2>/dev/null; export -f ranpick
 
 cache_manifest(){
   # Brief: Cache Manifest. Fail if no manifest is found. Emit trusted gateway URL if fail to decrypt.
@@ -89,10 +100,10 @@ cache_manifest(){
   local manifest="${cache_dir}/${peerID}"
   if is_expired "${manifest}" || "${refresh}"; then
     "${refresh}" || rm -f "${manifest}"
-    local block="$( if ipfs_path="$(ipfs name resolve --nocache --dhtt=3s "${peerID}")"; then
+    local block="$( if ipfs_path="$(ipfs name resolve --nocache --dhtt=10s "${peerID}")"; then
                       ipfs cat "${ipfs_path}/index.html"
                     else
-                      curl -sfLo- "${ipfs_path_gw}/ipns/${peerID}/index.html"
+                      timeout 10 curl -sfLo- "${ipfs_path_gw}/ipns/${peerID}/index.html"
                     fi | sed -n '/<!--ipns-link--/,/--ipns-link-->/{//!p;}' )"
     [[ -n "${block}" ]] || return 1 # PeerID not using IPNS-Link
     local tmpfile="$(mktemp -p "${cache_dir}")"; trap "rm -f ${tmpfile}" return
@@ -118,17 +129,38 @@ connect(){
       return 1
     fi
   } &>/dev/null
-  # Check if already connected
-  ipfs swarm peers | grep -q -m1 "/p2p/${nodeID}$" && return 0
-  # First, choose a multiaddress at random - this distributes the load between different routes
-  route="$(key_val multiaddress.route[] "${peerID}" | ranpick)"
-  connect_and_peer "${route}/p2p/${nodeID}" && return 0
+
+  # Concurrent requests should be served by only one `connect` worker. Hence using lock.
+  local connect_lock="${cache_dir}/${nodeID}.lock"
+  # When connect_lock doesnt exist create it and make it look stale.
+  [[ -f "${connect_lock}" ]] || touch -d '1 day ago' "${connect_lock}"
+  (# Lock on FD 3.
+  if flock -n 3; then
+    acquire_lock=true
+  else
+    acquire_lock=false # Failed to acquire exclusive lock. i.e. another connect method is working
+    flock -s 3 # Wait to acquire shared lock. i.e. wait for the busy worker to finish
+  fi
+  ipfs swarm peers | grep -q -m1 "/p2p/${nodeID}$" && exit 0 # Return happy if already connected
+  ${acquire_lock} || exit 1 # Another handler had just tried to connect and failed. So why try in vain.
+  is_expired "${connect_lock}" 300 || exit 1 # A connect method was executed within last 5m. So why try again?
+  touch "${connect_lock}" # Only the busy worker (which acquired lock) can modify lock. Others have exited by now
+  start_time="${EPOCHSECONDS}" # Timestamping
+  # First, choose a multiaddress at random, with preference for non-relayed addresses
+  ## Random selection distributes the load between different routes
+  route="$(key_val multiaddress.route[] "${peerID}" | grep -v '/p2p-circuit' | ranpick)"
+  connect_and_peer "${route}/p2p/${nodeID}" && exit 0
+  route="$(key_val multiaddress.route[] "${peerID}" | grep '/p2p-circuit' | ranpick)"
+  connect_and_peer "${route}/p2p/${nodeID}" && exit 0
   # Failure means probably the dynamic address / relay changed; so refresh manifest
   cache_manifest -f "${peerID}"; nodeID="$(key_val multiaddress.ID "${peerID}")"
   # This time, try every route. Note we are doing this regardless of whether manifest was refreshed or not
   for route in $(key_val multiaddress.route[] "${peerID}"); do
-    connect_and_peer "${route}/p2p/${nodeID}" && return 0
+    ((EPOCHSECONDS-start_time < 95)) || exit 1 # Too much time passed. Let's give up
+    connect_and_peer "${route}/p2p/${nodeID}" && exit 0
   done
+  exit 1
+  ) 3< "${connect_lock}"
 } &>/dev/null; export -f connect
 
 rate_limiter(){
@@ -195,7 +227,7 @@ serve(){
   # Brief: Serve resource/webpage at the given path
   # Usage: serve [<path> | <(cmd) | <named-pipe>]
   [[ "${method}" == @(GET|HEAD) ]] || error 405 "Method Not Allowed"
-  local page="${1:-index.html}"
+  local page="${1:-index.html}"; page="${page##*/}" # Makes sure only pages from within repo are served
   [[ -f "${page}" ]] || error
   printf "%s\r\n" "HTTP/1.1 200 OK"
   printf "Connection: %s\r\n" "close"
@@ -265,7 +297,11 @@ handler(){
   # Brief: Main handler routine spawned by server on new connection from client.
   local ipfs_pid; read -u3 ipfs_pid
   trap "flock -u 3 ; flock -n ${pid_file} -c 'kill -STOP ${ipfs_pid}'" exit # Reason for flock -n: If failed to lock, the running handler will pause on exit
-  flock -s 3 && kill -CONT "${ipfs_pid}" # Resume ipfs after acquiring shared lock
+  # Resume ipfs after acquiring shared lock
+  flock -s 3
+  until (kill -CONT "${ipfs_pid}" && timeout 1 ipfs swarm peers) &>/dev/null; do
+    kill -0 "${ipfs_pid}" || error 500 "Internal Server Error"
+  done
   rate_limiter "${SOCAT_PEERADDR}" || error 429 "Too many requests"
   local method path version headers host port proto
   read_req_head
@@ -356,13 +392,15 @@ EOF
 
 main(){
   # Brief: The main driver
-  export gateway_port=8080 max_conns=500 req_per_min=120 # Defaults
+  export gateway_port=8080 max_conns=500 req_per_min=120 password=admin # Defaults
   local OPTIND=1 opt
-  while getopts p:m:r:c:vh opt; do
+  while getopts p:m:r:a:c:vh opt; do
     case "${opt}" in
       p) gateway_port="${OPTARG}";;
       m) max_conns="${OPTARG}";;
       r) req_per_min="${OPTARG}";;
+      a) password="${OPTARG}"
+        [[ "${password}" =~ ^[[:alnum:]]*$ ]] || { echo "Error: Only alphanumeric password" >&2; exit;};;
       c) eval "${OPTARG}"; exit $?;;
       v) echo "${version}"; exit;;
       h | *) usage; exit 1;;
@@ -381,19 +419,38 @@ main(){
     echo "Error: Please run as root, using sudo" >&2; exit 1
   fi
 
-  if init; then
-    echo "Status: Launched IPFS daemon"
-    kill -STOP "$(<"${pid_file}")"
-    trap "kill -CONT $(<"${pid_file}"); ipfs shutdown; gpgconf --kill gpg-agent" exit # This is trap for global exit; not `handler` exit
+  flock -n index.html -c : || { echo "Error: Another instance running" >&2; exit 1;}
+  socat -T 0.1 TCP:127.0.0.1:"${gateway_port}" FILE:/dev/null &>/dev/null && \
+    { echo "Error: Port ${gateway_port} already in use" >&2; exit 1;}
+  echo "Status: Launching the Gateway server" >&2
+  rm -f "?admin_pass="*
+  local log="?admin_pass=${password}"; : > "${log}"
+  (
+    flock -n 100 || exit 1 # Lock on index.html means another Gateway is already up 
+    trap '' HUP
+    trap 'kill_proc_tree $(<"${pid_file}"); kill_proc_tree $BASHPID; gpgconf --kill gpg-agent' exit TERM INT QUIT
+    if init; then
+      echo "Status: Launched IPFS daemon"
+      kill -STOP "$(<"${pid_file}")"
+    else
+      echo "Error: Failed to launch IPFS daemon"
+      exit 1
+    fi
+    socat -T120 TCP-LISTEN:"${gateway_port}",max-children="${max_conns}",fork,reuseaddr \
+      SYSTEM:"${BASH_SOURCE} -c handler" &
+    wait $! # This hack makes sure the subshell can always execute traps when signalled
+    echo -e "\nStatus: Exiting ..."
+  ) &>>"${log}" 100< "index.html" &
+  local server_pid=$!
+  echo -e "\nPID: ${server_pid}" | tee -a "${log}" >&2
+  tail -f "${log}" | grep -im1 'IPFS daemon$' # Wait for the `init` routine to finish
+  sleep 2 # Give socat time to set up before checking with it
+  if (curl -sfLI "${gateway_url}" && kill -0 "${server_pid}")&>/dev/null; then
+    echo "Status: Listening for connections at port=${gateway_port} with URL= ${gateway_url} ..." >&2
   else
-    echo "Error: Failed to launch IPFS daemon"
-    exit 1
-  fi >&2
-
-  echo "Status: Listening for connections at port=${gateway_port} with URL=${gateway_url} ..." >&2
-  socat -T60 TCP-LISTEN:"${gateway_port}",max-children="${max_conns}",fork,reuseaddr \
-    SYSTEM:"${BASH_SOURCE} -c handler"
-  echo -e "\nStatus: Exiting ..." >&2
+    kill "${server_pid}" &>/dev/null
+    echo "Error: Whoopsie. Something failed." >&2
+  fi
 }
 
 dep_check(){

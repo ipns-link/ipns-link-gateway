@@ -1,31 +1,39 @@
 #!/usr/bin/env -S bash -O extglob
 export LANGUAGE=C LANG=C LC_ALL=C
 export PATH=bin:"${HOME}"/.bin:"${PATH}"
+export TIMEOUT=0 # Helps with: f(){ timeout ${TIMEOUT} cmd;} invoked as `TIMEOUT=<seconds> f`
 
 usage(){
   echo "
 Brief: Locally host an IPNS-Link-Gateway
-Repo: https://github.com/ipns-link
+Repo: https://github.com/ipns-link/ipns-link-gateway
 Synopsis: ipns-link-gateway [options] [<URL>]
 Options:
   -p <TCP port no. gateway listens at> # Default: 8080
   -m <max no. of concurrent connections> # Default: 500
   -r <no. of requests allowed per minute> # Default: 120
+  -a <any alphanumeric password string> # Default: admin
+  -u </path/to/unix/domain/socket> # Overrides -p option, if any
   -v # Version
   -h # Usage / Help
+Environment Variables:
+  IPFS_SUBD_GW : URL of a highly available subdomain-based IPFS-gateway # Default: https://cf-ipfs.com
+    # Requests for static contents are redirected to this gateway
+  IPFS_PATH_GW : URL of a highly available path-based IPFS-gateway # Default: https://ipfs.io
+    # Static contents are served from this gateway. If unavailable, IPNS-Link-Gateway falls back to its local IPFS gateway.
 Example: ipns-link-gateway # Uses the default URL http://localhost:8080
 Example: ipns-link-gateway -p \$PORT \$URL
 " 
 } >&2; export -f usage
 
-export version=1.0.1
+export version=1.0.2
 export IPFS_PATH="${PWD}/.ipfs"
 export cache_dir="${IPFS_PATH}/.cache"
 export GNUPGHOME="${IPFS_PATH}/.gpg"
 export sockets="${IPFS_PATH}/.sockets"
 export pid_file="${IPFS_PATH}/.pid"
-export ipfs_subd_gw="https://cf-ipfs.com" # For redirects
-export ipfs_path_gw="https://ipfs.io" # For direct downloads
+export ipfs_subd_gw="${IPFS_SUBD_GW:-https://cf-ipfs.com}" # For redirects
+export ipfs_path_gw="${IPFS_PATH_GW:-https://ipfs.io}" # For direct downloads
 
 kill_proc_tree(){
   # Brief: Kill (with SIGKILL) all descendants of the process id given, with the given signal, if any
@@ -258,7 +266,7 @@ forward(){
     cache_path="$(key_val cache.path ${peerID})" && cache_cid="$(key_val cache.CID ${peerID})" && \
     [[ "${path}" =~ ^"${cache_path}" ]]; then
       local ipfs_path="/ipfs/${cache_cid}/${path#${cache_path}}"
-      # Use cloudflare's gateway for speed/caching by all IPNS-Link-Gateways; Fallback to local gateway on failure
+      # Use a common/central gateway for speed/caching by all IPNS-Link-Gateways; Fallback to local gateway on failure
       { curl --http1.1 -H "${etag_header}" -Nsfio- "${ipfs_path_gw}/${ipfs_path}" || \
         curl --http1.1 -H "${etag_header}" -Nsio- --unix-socket "${sockets}/gateway" localhost/"${ipfs_path#/}";} | \
           inject_conn_close
@@ -390,69 +398,6 @@ EOF
   [[ "$((ipfs daemon --enable-namesys-pubsub --enable-gc & echo $! > "${pid_file}") | grep -iom1 'Daemon is ready' & tail -f --pid=$! /dev/null)" ]] || return 1 # Launcher
 } &>/dev/null; export -f init
 
-main(){
-  # Brief: The main driver
-  export gateway_port=8080 max_conns=500 req_per_min=120 password=admin # Defaults
-  local OPTIND=1 opt
-  while getopts p:m:r:a:c:vh opt; do
-    case "${opt}" in
-      p) gateway_port="${OPTARG}";;
-      m) max_conns="${OPTARG}";;
-      r) req_per_min="${OPTARG}";;
-      a) password="${OPTARG}"
-        [[ "${password}" =~ ^[[:alnum:]]*$ ]] || { echo "Error: Only alphanumeric password" >&2; exit;};;
-      c) eval "${OPTARG}"; exit $?;;
-      v) echo "${version}"; exit;;
-      h | *) usage; exit 1;;
-    esac
-  done
-  local arg="${!OPTIND:-http://localhost:8080}"
-  if [[ "${arg}" =~ ^(http|https)://([-[:alnum:].]+)(:[[:digit:]]+)?$ ]]; then
-    export gateway_url="${arg}"
-    export gateway_host="${BASH_REMATCH[2]}"
-  else
-    echo "Provide gateway-URL of the form http(s)://fully.qualified.domain(:port)" >&2
-    usage; exit 1
-  fi
-
-  if (( "${gateway_port}" < 1024 )) && ((EUID != 0)); then
-    echo "Error: Please run as root, using sudo" >&2; exit 1
-  fi
-
-  flock -n index.html -c : || { echo "Error: Another instance running" >&2; exit 1;}
-  socat -T 0.1 TCP:127.0.0.1:"${gateway_port}" FILE:/dev/null &>/dev/null && \
-    { echo "Error: Port ${gateway_port} already in use" >&2; exit 1;}
-  echo "Status: Launching the Gateway server" >&2
-  rm -f "?admin_pass="*
-  local log="?admin_pass=${password}"; : > "${log}"
-  (
-    flock -n 100 || exit 1 # Lock on index.html means another Gateway is already up 
-    trap '' HUP
-    trap 'kill_proc_tree $(<"${pid_file}"); kill_proc_tree $BASHPID; gpgconf --kill gpg-agent' exit TERM INT QUIT
-    if init; then
-      echo "Status: Launched IPFS daemon"
-      kill -STOP "$(<"${pid_file}")"
-    else
-      echo "Error: Failed to launch IPFS daemon"
-      exit 1
-    fi
-    socat -T120 TCP-LISTEN:"${gateway_port}",max-children="${max_conns}",fork,reuseaddr \
-      SYSTEM:"${BASH_SOURCE} -c handler" &
-    wait $! # This hack makes sure the subshell can always execute traps when signalled
-    echo -e "\nStatus: Exiting ..."
-  ) &>>"${log}" 100< "index.html" &
-  local server_pid=$!
-  echo -e "\nPID: ${server_pid}" | tee -a "${log}" >&2
-  tail -f "${log}" | grep -im1 'IPFS daemon$' # Wait for the `init` routine to finish
-  sleep 2 # Give socat time to set up before checking with it
-  if (curl -sfLI "${gateway_url}" && kill -0 "${server_pid}")&>/dev/null; then
-    echo "Status: Listening for connections at port=${gateway_port} with URL= ${gateway_url} ..." >&2
-  else
-    kill "${server_pid}" &>/dev/null
-    echo "Error: Whoopsie. Something failed." >&2
-  fi
-}
-
 dep_check(){
   # Brief: Check major dependencies
   local ipfs_version quit
@@ -496,11 +441,78 @@ report_updates(){
   fi
 } >&2 2>/dev/null
 
-(git check-ignore -q ".ipfs" && git check-ignore -q "pubkey")&>/dev/null || \
-  { echo "Must be run from the original git-repo that you git-cloned" >&2; exit 1;}
+pre_flight(){
+  # Brief: Some routine checks before launching the Gateway server.
+  # Note: NOT to be executed before invoking `handler`. Otherwise it'd unnecessarily worsen latency.
+  (git check-ignore -q ".ipfs" && git check-ignore -q "pubkey")&>/dev/null || \
+    { echo "Must be run from the original git-repo that you git-cloned" >&2; exit 1;}
+  dep_check
+  report_updates
+}
 
-dep_check
+main(){
+  # Brief: The main driver
+  export gateway_port=8080 max_conns=500 req_per_min=120 password=admin # Defaults
+  local OPTIND=1 opt
+  while getopts c:p:u:m:r:a:vh opt; do
+    case "${opt}" in
+      c) eval "${OPTARG}"; exit $?;;
+      p) gateway_port="${OPTARG}";;
+      u) export unix_socket="${OPTARG}"; gateway_port=;; # Empty gateway_port to override it
+      m) max_conns="${OPTARG}";;
+      r) req_per_min="${OPTARG}";;
+      a) password="${OPTARG}"
+        [[ "${password}" =~ ^[[:alnum:]]*$ ]] || { echo "Error: Only alphanumeric password" >&2; exit;};;
+      v) echo "${version}"; exit;;
+      h | *) usage; exit 1;;
+    esac
+  done
+  local arg="${!OPTIND:-http://localhost:8080}"
+  if [[ "${arg}" =~ ^(http|https)://([-[:alnum:].]+)(:[[:digit:]]+)?$ ]]; then
+    export gateway_url="${arg}"
+    export gateway_host="${BASH_REMATCH[2]}"
+  else
+    echo "Provide gateway-URL of the form http(s)://fully.qualified.domain(:port)" >&2
+    usage; exit 1
+  fi
 
-report_updates
+  if (( "${gateway_port}" < 1024 )) && ((EUID != 0)); then
+    echo "Error: Please run as root, using sudo" >&2; exit 1
+  fi
+
+  pre_flight
+  flock -n index.html -c : || { echo "Error: Another instance running" >&2; exit 1;}
+  socat -T 0.1 TCP:127.0.0.1:"${gateway_port}" FILE:/dev/null &>/dev/null && \
+    { echo "Error: Port ${gateway_port} already in use" >&2; exit 1;}
+  echo "Status: Launching the Gateway server" >&2
+  rm -f "?admin_pass="*
+  local log="?admin_pass=${password}"; : > "${log}"
+  (
+    flock -n 100 || exit 1 # Lock on index.html means another Gateway is already up 
+    trap '' HUP
+    trap 'gpgconf --kill gpg-agent; kill_proc_tree $(<"${pid_file}"); kill_proc_tree $BASHPID' exit TERM INT QUIT
+    if init; then
+      echo "Status: Launched IPFS daemon"
+      kill -STOP "$(<"${pid_file}")"
+    else
+      echo "Error: Failed to launch IPFS daemon"
+      exit 1
+    fi
+    socat -T120 TCP-LISTEN:"${gateway_port}",max-children="${max_conns}",fork,reuseaddr \
+      SYSTEM:"${BASH_SOURCE} -c handler" &
+    wait $! # This hack makes sure the subshell can always execute traps when signalled
+    echo -e "\nStatus: Exiting ..."
+  ) &>>"${log}" 100< "index.html" &
+  local server_pid=$!
+  echo -e "\nPID: ${server_pid}" | tee -a "${log}" >&2
+  tail -f "${log}" | grep -im1 'IPFS daemon$' # Wait for the `init` routine to finish
+  sleep 2 # Give socat time to set up before checking with it
+  if (curl -sfLI "${gateway_url}" && kill -0 "${server_pid}")&>/dev/null; then
+    echo "Status: Listening for connections at port=${gateway_port} with URL= ${gateway_url} ..." >&2
+  else
+    kill "${server_pid}" &>/dev/null
+    echo "Error: Whoopsie. Something failed." >&2
+  fi
+}
 
 main "${@}"

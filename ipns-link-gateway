@@ -11,22 +11,23 @@ Synopsis: ipns-link-gateway [options] [<URL>]
 Options:
   -p <TCP port no. gateway listens at> # Default: 8080
   -m <max no. of concurrent connections> # Default: 500
-  -r <no. of requests allowed per minute> # Default: 120
+  -r <no. of requests allowed per minute> # Default: 120. Use 0 to turn off rate-limiting
   -a <any alphanumeric password string> # Default: admin
   -u </path/to/unix/domain/socket> # Overrides -p option, if any
   -v # Version
+  -U # Update
   -h # Usage / Help
 Environment Variables:
   IPFS_SUBD_GW : URL of a highly available subdomain-based IPFS-gateway # Default: https://cf-ipfs.com
     # Requests for static contents are redirected to this gateway
   IPFS_PATH_GW : URL of a highly available path-based IPFS-gateway # Default: https://ipfs.io
-    # Static contents are served from this gateway. If unavailable, IPNS-Link-Gateway falls back to its local IPFS gateway.
-Example: ipns-link-gateway # Uses the default URL http://localhost:8080
-Example: ipns-link-gateway -p \$PORT \$URL
+    # Static contents are served from this gateway if needed
+Example: ipns-link-gateway -a password # Uses the default URL http://localhost:8080
+Example: ipns-link-gateway -a \$PASSWORD -p \$PORT \$URL
 " 
 } >&2; export -f usage
 
-export version=1.0.2
+export version=1.0.3
 export IPFS_PATH="${PWD}/.ipfs"
 export cache_dir="${IPFS_PATH}/.cache"
 export GNUPGHOME="${IPFS_PATH}/.gpg"
@@ -164,7 +165,7 @@ connect(){
   cache_manifest -f "${peerID}"; nodeID="$(key_val multiaddress.ID "${peerID}")"
   # This time, try every route. Note we are doing this regardless of whether manifest was refreshed or not
   for route in $(key_val multiaddress.route[] "${peerID}"); do
-    ((EPOCHSECONDS-start_time < 95)) || exit 1 # Too much time passed. Let's give up
+    ((EPOCHSECONDS-start_time < 60)) || exit 1 # Too much time passed. Let's give up
     connect_and_peer "${route}/p2p/${nodeID}" && exit 0
   done
   exit 1
@@ -174,6 +175,7 @@ connect(){
 rate_limiter(){
   # Brief: Rate limiter
   # Usage: rate_limiter <clientIP>
+  ((req_per_min != 0)) || return 0
   local allowed="${req_per_min}" interval=60 # Allowed n connections from any given IP per m seconds interval
   local register="${cache_dir}/${1}"
   local count="$((flock -s 0 && wc -l) < "${register}")" # Read lock on register
@@ -191,6 +193,7 @@ error(){
   local code="${1:-404}" msg="${2:-Not found}"
   printf "%s\r\n" "HTTP/1.1 ${code} ${msg}"
   printf "Connection: %s\r\n" "close"
+  [[ -f "${code}".html ]] && msg="$(<"${code}".html)"
   printf "Content-Length: %d\r\n" "${#msg}"
   printf "\r\n%s" "${msg}"
   exit
@@ -239,10 +242,25 @@ serve(){
   [[ -f "${page}" ]] || error
   printf "%s\r\n" "HTTP/1.1 200 OK"
   printf "Connection: %s\r\n" "close"
-  printf "Content-Length: %d\r\n\r\n" "$(wc -c < "${page}")"
+  printf "Content-Length: %d\r\n" "$(wc -c < "${page}")"
+  printf "Content-Type: %s\r\n" "$(file -ib "${page}")"
+  echo -e "\r"
   [[ "${method}" == HEAD ]] || cat "${page}"
   exit
 } 2>/dev/null; export -f serve
+
+dl_ipfs_cache_struct(){
+  # Brief: Manifest provides just the CID of the cache repo. This downloads the directory structure
+  # Usage: dl_ipfs_cache_struct <CID or cache repo>
+  # Note: Using `ipfs ls` recursively instead of `ipfs refs -r` because the latter doesn't fetch filenames
+  # TODO: This was put together hurriedly. Doesn't pause ipfs when done. Improve.
+  local cid="${1}"
+  [[ -n "${cid}" ]] || return
+  local link
+  for link in $(ipfs ls --size=false "${cid}");do
+    [[ "${link: -1:1}" == / ]] && dl_ipfs_cache_struct "$(awk 'NF {print $1}' <<< "${link}")"
+  done
+} &>/dev/null; export -f dl_ipfs_cache_struct
 
 forward(){
   # Brief: Proxy to Origin-server, serve from IPFS or redirect to IPFS gateway
@@ -261,15 +279,18 @@ forward(){
   local etag_header="$(grep -im1 '^If-None-Match: ' <<< "${headers}")"; etag_header="${etag_header%$'\r'}"
 
   # Handle static cache hosted on IPFS
-  local cache_path cache_cid
+  local cache_path cache_cid="$(key_val cache.CID ${peerID})"
   if [[ "${method}" == GET ]] && \
-    cache_path="$(key_val cache.path ${peerID})" && cache_cid="$(key_val cache.CID ${peerID})" && \
+    cache_path="$(key_val cache.path ${peerID})" && [[ -n "${cache_cid}" ]] && \
     [[ "${path}" =~ ^"${cache_path}" ]]; then
       local ipfs_path="/ipfs/${cache_cid}/${path#${cache_path}}"
-      # Use a common/central gateway for speed/caching by all IPNS-Link-Gateways; Fallback to local gateway on failure
-      { curl --http1.1 -H "${etag_header}" -Nsfio- "${ipfs_path_gw}/${ipfs_path}" || \
-        curl --http1.1 -H "${etag_header}" -Nsio- --unix-socket "${sockets}/gateway" localhost/"${ipfs_path#/}";} | \
-          inject_conn_close
+      # Use the local gateway for speed
+      if ! curl --http1.1 -H "${etag_header}" -Nsfio- --unix-socket "${sockets}/gateway" localhost/"${ipfs_path#/}"; then
+        # On cache-miss, retrieve from remote gateway as well as cache the downloaded content
+        # Can't let this fail silently as http response needs to be sent to client
+        curl --http1.1 -H "${etag_header}" -Nsio- "${ipfs_path_gw}/${ipfs_path}" | \
+          tee >(sed -n '/^\r$/q'; cat | ipfs add --pin=false &>/dev/null)
+      fi | inject_conn_close
       exit # Close connection
   fi
   
@@ -279,8 +300,9 @@ forward(){
     if on_fail="$(key_val on_fail ${peerID})"; then
       redirect "${on_fail}"
     else
-      error
+      error 502 "Bad Gateway"
     fi
+  dl_ipfs_cache_struct "${cache_cid}" & # TODO: Fix. In bg doesn't pause ipfs when done.
 
   # Handle streams / dynamic cache using ipns-path. Pass if there's no link at the ipns-path
   local stream_path stream_kid
@@ -306,14 +328,15 @@ handler(){
   local ipfs_pid; read -u3 ipfs_pid
   trap "flock -u 3 ; flock -n ${pid_file} -c 'kill -STOP ${ipfs_pid}'" exit # Reason for flock -n: If failed to lock, the running handler will pause on exit
   # Resume ipfs after acquiring shared lock
-  flock -s 3
-  until (kill -CONT "${ipfs_pid}" && timeout 1 ipfs swarm peers) &>/dev/null; do
-    kill -0 "${ipfs_pid}" || error 500 "Internal Server Error"
-  done
+  flock -s 3; kill -CONT "${ipfs_pid}"
+  # Check if IPFS node is online and unpaused. Using API socket for this is faster than `ipfs swarm peers`
+  timeout 1 curl -sIo /dev/null --unix-socket "${sockets}/api" localhost || error 500 "Internal Server Error"
   rate_limiter "${SOCAT_PEERADDR}" || error 429 "Too many requests"
   local method path version headers host port proto
   read_req_head
-  flock -F . echo -e "\nLog: $(date +%D\ %H:%M:%S)\nIP: ${SOCAT_PEERADDR}\nHost: ${proto}://${host}${port}\nMethod: ${method}\nPath: ${path}" >&2 & # Non-blocking
+  # Don't log HEAD requests as there are simply too many of them if an uptime monitor is running
+  [[ "${method}" == HEAD ]] || \
+    flock -F . echo -e "\nLog: $(date +%D\ %H:%M:%S)\nIP: ${SOCAT_PEERADDR}\nHost: ${proto}://${host}${port}\nMethod: ${method}\nPath: ${path}" >&2 & # Non-blocking
   if [[ "${host}" == @(www."${gateway_host}"|"${gateway_host}") ]]; then
     if [[ "${path}" =~ ^/(ipns/|\?ipns-link-gateway=)([-[:alnum:].]+)((/|%2f|%2F).*)?$ ]]; then
       local peerID="$(b36_peerID "${BASH_REMATCH[2]}")"
@@ -332,8 +355,13 @@ handler(){
     forward "${subdomain}"
   elif [[ "${host}" =~ ^([a-z0-9]*).ipfs."${gateway_host}"$ ]]; then
     redirect "${ipfs_subd_gw}/ipfs/${BASH_REMATCH[1]}${path}" 303 "See Other"
+  elif [[ "${host}" =~ ^[[:digit:].]+$ ]]; then
+    # Ignore / serve index.html to requests with (the current) public IP as the hostname
+    serve
   elif [[ "${host}" =~ ^[-[:alnum:].]+$ ]]; then
     forward "${host}"
+  else
+    exit # Ignore everything else
   fi  
 } 3<"${pid_file}"; export -f handler
 
@@ -395,7 +423,10 @@ EOF
   fi
   ipfs config profile apply randomports; rm -f "${IPFS_PATH}/config-pre-"*
   (ipfs swarm peers || rm -f "${sockets}"/*) # Otherwise API and Gateway won't bind to existing UNIX socket
-  [[ "$((ipfs daemon --enable-namesys-pubsub --enable-gc & echo $! > "${pid_file}") | grep -iom1 'Daemon is ready' & tail -f --pid=$! /dev/null)" ]] || return 1 # Launcher
+  # TODO: Handle SIGHUP on `main` exit better.
+  # Without the following `setsid`, `ipfs daemon` surprisingly exits with SIGHUP, even with `nohup`, when `main` exits
+  # The `setsid`, thanks to its own subshell, doesn't fork and `exec`s into ipfs daemon. Hence they have same pid.
+  [[ "$((setsid ipfs daemon --enable-namesys-pubsub --enable-gc & echo $! > "${pid_file}") | grep -iom1 'Daemon is ready' & tail -f --pid=$! /dev/null)" ]] || return 1 # Launcher
 } &>/dev/null; export -f init
 
 dep_check(){
@@ -439,7 +470,7 @@ report_updates(){
     local current="v${version}"
     [[ "${current}" != "${latest}" ]] && echo "Updates available: ${current} -> ${latest}"
   fi
-} >&2 2>/dev/null
+} >&2 2>/dev/null; export -f report_updates
 
 pre_flight(){
   # Brief: Some routine checks before launching the Gateway server.
@@ -454,7 +485,7 @@ main(){
   # Brief: The main driver
   export gateway_port=8080 max_conns=500 req_per_min=120 password=admin # Defaults
   local OPTIND=1 opt
-  while getopts c:p:u:m:r:a:vh opt; do
+  while getopts c:p:u:m:r:a:vUh opt; do
     case "${opt}" in
       c) eval "${OPTARG}"; exit $?;;
       p) gateway_port="${OPTARG}";;
@@ -464,10 +495,11 @@ main(){
       a) password="${OPTARG}"
         [[ "${password}" =~ ^[[:alnum:]]*$ ]] || { echo "Error: Only alphanumeric password" >&2; exit;};;
       v) echo "${version}"; exit;;
+      U) report_updates && git pull; exit $?;;
       h | *) usage; exit 1;;
     esac
   done
-  local arg="${!OPTIND:-http://localhost:8080}"
+  local arg="${!OPTIND:-"http://localhost:${gateway_port:-8080}"}"
   if [[ "${arg}" =~ ^(http|https)://([-[:alnum:].]+)(:[[:digit:]]+)?$ ]]; then
     export gateway_url="${arg}"
     export gateway_host="${BASH_REMATCH[2]}"
@@ -476,8 +508,14 @@ main(){
     usage; exit 1
   fi
 
-  if (( "${gateway_port}" < 1024 )) && ((EUID != 0)); then
+  if [[ -e "${unix_socket}" ]]; then
+    echo "Error: Socket in use" >&2; exit 1
+  elif [[ -n "${gateway_port}" ]] && ((gateway_port < 1024)) && ((EUID != 0)); then
     echo "Error: Please run as root, using sudo" >&2; exit 1
+  elif [[ -n "${gateway_port}" ]]; then
+    export bind_addrs="TCP-LISTEN:${gateway_port}"
+  else
+    export bind_addrs="UNIX-LISTEN:${unix_socket}"
   fi
 
   pre_flight
@@ -489,8 +527,9 @@ main(){
   local log="?admin_pass=${password}"; : > "${log}"
   (
     flock -n 100 || exit 1 # Lock on index.html means another Gateway is already up 
-    trap '' HUP
-    trap 'gpgconf --kill gpg-agent; kill_proc_tree $(<"${pid_file}"); kill_proc_tree $BASHPID' exit TERM INT QUIT
+    # TODO: Handle SIGHUP on `main` exit better.
+    trap 'wait $socat_pid' HUP # When exiting, `main` sends SIGHUP. This catches and ignores it.
+    trap 'gpgconf --kill gpg-agent; kill_proc_tree $(<"${pid_file}"); kill_proc_tree $BASHPID; rm -f ${unix_socket}' exit TERM INT QUIT
     if init; then
       echo "Status: Launched IPFS daemon"
       kill -STOP "$(<"${pid_file}")"
@@ -498,21 +537,26 @@ main(){
       echo "Error: Failed to launch IPFS daemon"
       exit 1
     fi
-    socat -T120 TCP-LISTEN:"${gateway_port}",max-children="${max_conns}",fork,reuseaddr \
+    # TODO: Handle SIGHUP on `main` exit better.
+    # Without the following `setsid`, `socat` surprisingly exits with signal 1, i.e. SIGHUP, even with `nohup`, when `main` exits
+    setsid -w socat -T120 "${bind_addrs}",max-children="${max_conns}",fork,reuseaddr \
       SYSTEM:"${BASH_SOURCE} -c handler" &
-    wait $! # This hack makes sure the subshell can always execute traps when signalled
+    socat_pid=$!
+    wait $socat_pid # This makes sure the subshell can always execute traps when signalled, without waiting for socat to finish
     echo -e "\nStatus: Exiting ..."
   ) &>>"${log}" 100< "index.html" &
   local server_pid=$!
-  echo -e "\nPID: ${server_pid}" | tee -a "${log}" >&2
+  echo -e "PID: ${server_pid}\nGateway:v${version}" | tee -a "${log}" >&2
   tail -f "${log}" | grep -im1 'IPFS daemon$' # Wait for the `init` routine to finish
   sleep 2 # Give socat time to set up before checking with it
-  if (curl -sfLI "${gateway_url}" && kill -0 "${server_pid}")&>/dev/null; then
+  if kill -0 "${server_pid}" &>/dev/null; then
     echo "Status: Listening for connections at port=${gateway_port} with URL= ${gateway_url} ..." >&2
   else
     kill "${server_pid}" &>/dev/null
     echo "Error: Whoopsie. Something failed." >&2
+    exit 1
   fi
+  # TODO: Handle SIGHUP on `main` exit better.
 }
 
 main "${@}"

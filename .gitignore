@@ -2,3 +2,5 @@
 pubkey
 .ipfs
 ?admin_pass=*
+*.log
+socket

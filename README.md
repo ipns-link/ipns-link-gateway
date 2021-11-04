@@ -4,6 +4,8 @@
 
 Prototype implementation of [IPNS-Link-gateway](https://github.com/ipns-link/specs).
 
+This implementation doesn't support HTTP/2. It prefers HTTP/1.1 but can't support persistent connections. To enable HTTP2 and persistent connections, simply put a reverse-proxy in front. If you choose to use [Caddy](https://caddyserver.com/), which helps with automatic HTTPS too, this project repository contains a ready [Caddyfile](/Caddyfile).
+
 ## Table of Contents  
 [![tocgen](https://img.shields.io/badge/Generated%20using-tocgen-blue)](https://github.com/SomajitDey/tocgen)  
   - [IPNS-Link-gateway](#ipns-link-gateway)  
@@ -51,9 +53,7 @@ See available command-line options with:
 
 ### Cloud-hosting
 
-Suppose your gateway is to have the domain `domain.tld`. So, first of all, purchase the domain and familiarize yourself with the DNS manager console of your domain registrar / DNS provider.
-
-**Note**: We can do without an A record, simply by forwarding `domain.tld` to the canonical URL: http(s)://www.domain.tld at the DNS manager console.
+Suppose your gateway is to have the URL: `https://domain.tld`. So, first of all, purchase the domain and familiarize yourself with the DNS manager console of your domain registrar / DNS provider. Create and store an API token for your DNS provider.
 
 ##### Heroku
 
@@ -69,7 +69,9 @@ Suppose your gateway is to have the domain `domain.tld`. So, first of all, purch
 
 ![Pricing](https://img.shields.io/badge/Pricing-Free--Tier-brightgreen) 
 
-To make sure you don't use any paid AWS services, make sure you stick to the following, if you don't know what you are doing. The following uses EC2 which is free for 1 year only with 750 hours/month. If you are stuck following any instruction below, or need help, refer to the [EC2 UserGuide](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/EC2_GetStarted.html).
+The following uses EC2 which is free for 1 year only with 750 hours/month. If you are stuck following any instruction below, or need further details, refer to the [EC2 UserGuide](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/EC2_GetStarted.html).
+
+**Aim**: The goal is to run the gateway at EC2, as a backend/upstream of a [Caddy](https://caddyserver.com/) reverse-proxy. Caddy would take care of HTTPS and everything else a modern server needs. If you don't know what all these mean, fear not. Just follow the steps below.
 
 1. [Sign up](https://aws.amazon.com/premiumsupport/knowledge-center/create-and-activate-aws-account/).
 
@@ -93,14 +95,26 @@ To make sure you don't use any paid AWS services, make sure you stick to the fol
    | -------- | ---- | ----------------------------- |
    | SSH      | 22   | Choose as appropriate for you |
    | HTTP     | 80   | 0.0.0.0/0                     |
+   | HTTPS    | 443  | 0.0.0.0/0                     |
 
 10. Choose "Launch".
 
 11. When prompted for a key pair, select "Choose an existing key pair", then select the key pair that you created when getting set up. When you are ready, select the acknowledgement check box, and then choose "Launch Instances".
 
-12. [Get the public DNS name of the instance](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/connection-prereqs.html).
+12. [Get the static public IPv4 address or public DNS name of the instance](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/connection-prereqs.html).
 
-13. Leaving the instance to launch, head over to your DNS provider and add the following CNAME record: `Type: CNAME ; Host: * ; Points to: your-ec2-public-DNS-name`.
+13. Leaving the instance to launch, head over to your DNS provider and add to/edit your DNS records as follows:
+
+    | Type  | Name   | Points to                           |
+    | ----- | ------ | ----------------------------------- |
+    | A     | @      | Static public IPv4 of your instance |
+    | CNAME | www    | @                                   |
+    | CNAME | ipns   | @                                   |
+    | CNAME | ipfs   | @                                   |
+    | CNAME | *.ipns | @                                   |
+    | CNAME | *.ipfs | @                                   |
+
+    **NOTE**: Restarting your EC2 instance doesn't change the public IP address. But everything else, such as starting/stopping or terminating and creating a new instance, does. Whenever you do such things that change the IP, simply update the IP in your DNS records.
 
 14. Locate the private key you downloaded earlier and SSH to your instance as 
 
@@ -108,7 +122,7 @@ To make sure you don't use any paid AWS services, make sure you stick to the fol
     ssh -i your-private-key-file ubuntu@www.domain.tld
     ```
 
-15. Download the project repo and move into it 
+15. Download the project repo and **move into it** 
 
     ```bash
     git clone https://github.com/ipns-link/ipns-link-gateway; cd ipns-link-gateway
@@ -120,21 +134,45 @@ To make sure you don't use any paid AWS services, make sure you stick to the fol
     bin/compile
     ```
 
-17. Launch the Gateway at port 80
+17. Install [Caddy](https://caddyserver.com/download) for Linux amd64, custom built with your DNS provider's plugin. For example's sake, we assume your DNS provider is CloudFlare.
+
+18. **Change to root**
 
     ```bash
-    sudo ./ipns-link-gateway -a "AlphanumericPassword" -p 80 "http://domain.tld"
+    sudo su root
     ```
 
-18. Note the PID shown. To stop the server later just do `sudo kill "PID"`
+19. Launch the Gateway
 
-19. The Gateway can now be availed at http://www.domain.tld.
+    ```bash
+    ./ipns-link-gateway -a "AlphanumericPassword" "https://domain.tld"
+    ```
 
-20. If you want https, either use the free-tier of [CloudFlare](https://support.cloudflare.com/hc/en-us/articles/205893698-Configure-Cloudflare-and-Heroku-over-HTTPS) or the always free [Let's Encrypt](https://letsencrypt.org/getting-started/).
+    Wait for the prompt to return.
+
+20. Note the PID shown. To stop the server later you can simply `sudo kill "PID"`.
+
+21. **Set the environment** 
+
+    ```bash
+    export DOMAIN="gateway.tld" DNS_PROV="cloudflare" API_TKN="Your-API-Token"
+    ```
+
+22. Start Caddy
+
+    ```bash
+    caddy start
+    ```
+
+    To stop `caddy` later you just gotta `caddy stop`.
+
+23. Caddy requests, installs and manages all the required SSL certificates on its own. The certificates are issued for free by [Let's Encrypt](https://letsencrypt.org/getting-started/) and [ZeroSSL](https://zerossl.com/). The Gateway can now be availed at https://www.domain.tld.
+
+24. To auto-start the gateway and caddy on reboot, create a [Cron job](https://crontab.guru/). Tutorial [here](https://opensource.com/article/17/11/how-use-cron-linux).
 
 ### Acknowledgements
 
-The `github-corner`s in [index.html](./index.html) is courtesy of [T. Holman](https://tholman.com/github-corners/).
+The GitHub-corners in [index.html](./index.html) is courtesy of [T. Holman](https://tholman.com/github-corners/).
 
 # Contribute
 

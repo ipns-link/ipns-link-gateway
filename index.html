@@ -1,7 +1,7 @@
 <html>
   <head>
     <meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1.0'>
-    <title>IPFS http proxy</title>
+    <title>IPNS-Link-Gateway</title>
     <meta name="title" content="ipns-link-gateway">
     <meta name='description' content='Public gateway or proxy to webapps exposed using IPNS'>
     <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
@@ -22,11 +22,13 @@
     <div><h2>Access dynamic and static websites exposed using IPNS</h2></div>
     <form action="/" method="GET">
       <div>
-        <br><label for="path"><strong>Address / URI</strong></label><br>
-        <br><input size="90%" name="ipns-link-gateway" id="path" pattern="[0-9a-zA-Z-.]+(\/.*)?" title="ipns-name/path" placeholder="k51qzi5uqu5dl0dbuh8rryv0uhcfid8y7rqpfylbjnsqsh2y1mv1i1sd2qx5hm/path OR example.com/path"><br>
+        <br><label for="path"><strong>IPNS-Name / DNSLink / *.ipns</strong></label><br>
+        <br><input size="60%" name="ipns-link-gateway" id="path" pattern="[0-9a-zA-Z-.]+(\/.*)?" title="key/path" placeholder="keyIPNS/path OR example.com/path OR name.ipns/path"><br>
       </div>
       <br><button>GET</button><br>
     </form><br>
+  <p><a href="https://github.com/ipns-link/ipns-link/blob/main/tutorials/QuickStart.md">Expose your site</a></p>
+  <p>Register FREE .ipns domains<span style="color:red"> (Coming Soon)</span></p>
   <p>
     <a href="https://github.com/ipns-link/specs">About</a> | 
     <a href="https://github.com/ipns-link/specs/blob/main/DISCLAIMER">Disclaimer</a> | 

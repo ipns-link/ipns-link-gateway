@@ -32,7 +32,7 @@ log "Killed running caddy"
 ./ipns-link-gateway -U # Update
 
 # Launch gateway
-if ./ipns-link-gateway -r 0 -u "${socket}" -a "${PASSWORD:-admin}" https://"${DOMAIN}" &>> cron.log; then
+if ./ipns-link-gateway -u "${socket}" -a "${PASSWORD:-admin}" https://"${DOMAIN}" &>> cron.log; then
   log "Launched Gateway"
 else
   log "Failed to launch Gateway. Exiting"

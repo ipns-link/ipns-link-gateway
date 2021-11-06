@@ -11,11 +11,12 @@ Synopsis: ipns-link-gateway [options] [<URL>]
 Options:
   -p <TCP port no. gateway listens at> # Default: 8080
   -m <max no. of concurrent connections> # Default: 500
-  -r <no. of requests allowed per minute> # Default: 120. Use 0 to turn off rate-limiting
+  -r <no. of requests allowed per minute> # Default: 200. Use 0 to turn off rate-limiting
   -a <any alphanumeric password string> # Default: admin
   -u </path/to/unix/domain/socket> # Overrides -p option, if any
   -v # Version
   -U # Update
+  -b # Run in blocking mode
   -h # Usage / Help
 Environment Variables:
   IPFS_SUBD_GW : URL of a highly available subdomain-based IPFS-gateway # Default: https://cf-ipfs.com
@@ -27,7 +28,7 @@ Example: ipns-link-gateway -a \$PASSWORD -p \$PORT \$URL
 " 
 } >&2; export -f usage
 
-export version=1.0.3
+export version=1.0.4
 export IPFS_PATH="${PWD}/.ipfs"
 export cache_dir="${IPFS_PATH}/.cache"
 export GNUPGHOME="${IPFS_PATH}/.gpg"
@@ -152,7 +153,7 @@ connect(){
   fi
   ipfs swarm peers | grep -q -m1 "/p2p/${nodeID}$" && exit 0 # Return happy if already connected
   ${acquire_lock} || exit 1 # Another handler had just tried to connect and failed. So why try in vain.
-  is_expired "${connect_lock}" 300 || exit 1 # A connect method was executed within last 5m. So why try again?
+  is_expired "${connect_lock}" 60 || exit 1 # A connect method was executed within last 1m. So why try again?
   touch "${connect_lock}" # Only the busy worker (which acquired lock) can modify lock. Others have exited by now
   start_time="${EPOCHSECONDS}" # Timestamping
   # First, choose a multiaddress at random, with preference for non-relayed addresses
@@ -221,7 +222,11 @@ read_req_head(){
   ## Set the "method", "path", "version", "host", "port", "proto" variables
   read -rd $'\r\n' method path version && read # Reading the complete start-line
   # Load current headers, including the delimiting blank line. Note: sed -u to make things unbuffered
-  headers="$(sed -u '/^\r$/q' | sed -u '/^X-Forwarded-For:/Id')"
+  headers="$(sed -u '/^\r$/q')"
+  # Remove X-Forwarded-For after determining the client IP, as required for rate-limiting
+  local x_fwd_for="$(grep -i -m1 '^X-Forwarded-For:' <<< "${headers}" | tr -d \\r | tr ',' ' ' | awk 'NF {print $2}')"
+  clientIP="${x_fwd_for:-"${SOCAT_PEERADDR}"}"
+  headers="$(sed -u '/^X-Forwarded-For:/Id' <<< "${headers}")"
   # "host" is retrieved preferably from the X-Forwarded-Host header; the Host header otherwise
   local x_fwd_host="$(grep -i -m1 '^X-Forwarded-Host:' <<< "${headers}" | tr -d \\r | tr ',' ' ' | awk 'NF {print $2}')"
   local x_fwd_proto="$(grep -i -m1 '^X-Forwarded-Proto:' <<< "${headers}" | tr -d \\r | tr ',' ' ' | awk 'NF {print $2}')"
@@ -330,13 +335,13 @@ handler(){
   # Resume ipfs after acquiring shared lock
   flock -s 3; kill -CONT "${ipfs_pid}"
   # Check if IPFS node is online and unpaused. Using API socket for this is faster than `ipfs swarm peers`
-  timeout 1 curl -sIo /dev/null --unix-socket "${sockets}/api" localhost || error 500 "Internal Server Error"
-  rate_limiter "${SOCAT_PEERADDR}" || error 429 "Too many requests"
-  local method path version headers host port proto
+  timeout 10 curl -sIo /dev/null --unix-socket "${sockets}/api" localhost || error 500 "Internal Server Error"
+  local method path version headers host port proto clientIP
   read_req_head
+  rate_limiter "${clientIP}" || error 429 "Too many requests"
   # Don't log HEAD requests as there are simply too many of them if an uptime monitor is running
   [[ "${method}" == HEAD ]] || \
-    flock -F . echo -e "\nLog: $(date +%D\ %H:%M:%S)\nIP: ${SOCAT_PEERADDR}\nHost: ${proto}://${host}${port}\nMethod: ${method}\nPath: ${path}" >&2 & # Non-blocking
+    flock -F . echo -e "\nLog: $(date +%D\ %H:%M:%S)\nIP: ${clientIP}\nHost: ${proto}://${host}${port}\nMethod: ${method}\nPath: ${path}" >&2 & # Non-blocking
   if [[ "${host}" == @(www."${gateway_host}"|"${gateway_host}") ]]; then
     if [[ "${path}" =~ ^/(ipns/|\?ipns-link-gateway=)([-[:alnum:].]+)((/|%2f|%2F).*)?$ ]]; then
       local peerID="$(b36_peerID "${BASH_REMATCH[2]}")"
@@ -483,9 +488,9 @@ pre_flight(){
 
 main(){
   # Brief: The main driver
-  export gateway_port=8080 max_conns=500 req_per_min=120 password=admin # Defaults
+  export gateway_port=8080 max_conns=500 req_per_min=200 password=admin block=false # Defaults
   local OPTIND=1 opt
-  while getopts c:p:u:m:r:a:vUh opt; do
+  while getopts c:p:u:m:r:a:vUhb opt; do
     case "${opt}" in
       c) eval "${OPTARG}"; exit $?;;
       p) gateway_port="${OPTARG}";;
@@ -496,6 +501,7 @@ main(){
         [[ "${password}" =~ ^[[:alnum:]]*$ ]] || { echo "Error: Only alphanumeric password" >&2; exit;};;
       v) echo "${version}"; exit;;
       U) report_updates && git pull; exit $?;;
+      b) block=true ;; # Blocking mode, opposed to background daemon mode. Required for Heroku for example
       h | *) usage; exit 1;;
     esac
   done
@@ -551,6 +557,7 @@ main(){
   sleep 2 # Give socat time to set up before checking with it
   if kill -0 "${server_pid}" &>/dev/null; then
     echo "Status: Listening for connections at port=${gateway_port} with URL= ${gateway_url} ..." >&2
+    if $block; then trap "kill ${server_pid} &>/dev/null" exit; wait "${server_pid}"; exit;fi
   else
     kill "${server_pid}" &>/dev/null
     echo "Error: Whoopsie. Something failed." >&2

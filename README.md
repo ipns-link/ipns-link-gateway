@@ -4,7 +4,7 @@
 
 Prototype implementation of [IPNS-Link-gateway](https://github.com/ipns-link/specs).
 
-This implementation doesn't support HTTP/2. It prefers HTTP/1.1 but can't support persistent connections. To enable HTTP2 and persistent connections, simply put a reverse-proxy in front. If you choose to use [Caddy](https://caddyserver.com/), which helps with automatic HTTPS too, this project repository contains a ready [Caddyfile](/Caddyfile).
+This implementation doesn't support HTTP/2. It prefers HTTP/1.1 but can't support persistent connections. To enable HTTP2 and persistent connections, simply put a capable reverse-proxy in front. If you choose to use [Caddy](https://caddyserver.com/), which helps with automatic HTTPS too, this project repository contains a ready [Caddyfile](/Caddyfile).
 
 ## Table of Contents  
 [![tocgen](https://img.shields.io/badge/Generated%20using-tocgen-blue)](https://github.com/SomajitDey/tocgen)  
@@ -150,7 +150,7 @@ The following uses EC2 which is free for 1 year only with 750 hours/month. If yo
 
     Wait for the prompt to return.
 
-20. Note the PID shown. To stop the server later you can simply `sudo kill "PID"`.
+20. Note the PID shown. To stop the server later you can simply execute: `sudo kill "PID"`.
 
 21. **Set the environment** 
 
@@ -164,11 +164,13 @@ The following uses EC2 which is free for 1 year only with 750 hours/month. If yo
     caddy start
     ```
 
-    To stop `caddy` later you just gotta `caddy stop`.
+    To stop `caddy` later you just have to execute: `caddy stop`.
 
 23. Caddy requests, installs and manages all the required SSL certificates on its own. The certificates are issued for free by [Let's Encrypt](https://letsencrypt.org/getting-started/) and [ZeroSSL](https://zerossl.com/). The Gateway can now be availed at https://www.domain.tld.
 
-24. To auto-start the gateway and caddy on reboot, create a [Cron job](https://crontab.guru/). Tutorial [here](https://opensource.com/article/17/11/how-use-cron-linux).
+24. To update and restart the gateway and caddy periodically, and on reboot, create a [Cron job](https://opensource.com/article/17/11/how-use-cron-linux). You may use the crontab [file](/crontab) from this repo, after editing it as instructed therein. It logs in a `cron.log` file within this repo. Caddy logs in `caddy.log`.
+
+25. Create a free uptime monitor with say [UptimeRobot](https://uptimerobot.com/) to get notified whenever your server goes down.
 
 ### Acknowledgements
 

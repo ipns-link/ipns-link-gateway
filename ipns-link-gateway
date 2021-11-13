@@ -28,7 +28,7 @@ Example: ipns-link-gateway -a \$PASSWORD -p \$PORT \$URL
 " 
 } >&2; export -f usage
 
-export version=1.0.4
+export version=1.0.5
 export IPFS_PATH="${PWD}/.ipfs"
 export cache_dir="${IPFS_PATH}/.cache"
 export GNUPGHOME="${IPFS_PATH}/.gpg"
@@ -36,6 +36,7 @@ export sockets="${IPFS_PATH}/.sockets"
 export pid_file="${IPFS_PATH}/.pid"
 export ipfs_subd_gw="${IPFS_SUBD_GW:-https://cf-ipfs.com}" # For redirects
 export ipfs_path_gw="${IPFS_PATH_GW:-https://ipfs.io}" # For direct downloads
+export blacklist_file="${IPFS_PATH}/blacklist.txt"
 
 kill_proc_tree(){
   # Brief: Kill (with SIGKILL) all descendants of the process id given, with the given signal, if any
@@ -278,6 +279,7 @@ forward(){
   # Handle failure to download/decrypt Manifest and DNSLinks that resolve to IPFS paths
   local peerID="$(b36_peerID "${1}")" trusted_gw
   [[ -n "${peerID}" ]] || redirect "${ipfs_subd_gw}/ipns/${1}${path}" 303 "See Other"
+  grep -qw "${peerID}" "${blacklist_file}" && error 451 "Unavailable For Legal Reasons" # TODO: Use memory buffer instead of file to hold blacklist
   trusted_gw="$(cache_manifest "${peerID}")" || redirect "${ipfs_subd_gw}/ipns/${peerID}${path}" 303 "See Other"
   [[ -z "${trusted_gw}" ]] || redirect "${trusted_gw}/ipns/${peerID}${path}"
 
@@ -484,6 +486,9 @@ pre_flight(){
     { echo "Must be run from the original git-repo that you git-cloned" >&2; exit 1;}
   dep_check
   report_updates
+  # Download blacklist. We could use DNSLink + IPFS for this, but it might be too slow
+  local URL=https://raw.githubusercontent.com/ipns-link/gateway-registry/main/blocked.md
+  curl -sfL "${URL}" | grep -v '^#' | tr -d '\r' | awk 'NF {print $1}' > "${blacklist_file}"
 }
 
 main(){

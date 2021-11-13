@@ -4,14 +4,23 @@
 
 Prototype implementation of [IPNS-Link-gateway](https://github.com/ipns-link/specs).
 
-This implementation doesn't support HTTP/2. It prefers HTTP/1.1 but can't support persistent connections. To enable HTTP2 and persistent connections, simply put a capable reverse-proxy in front. If you choose to use [Caddy](https://caddyserver.com/), which helps with automatic HTTPS too, this project repository contains a ready [Caddyfile](/Caddyfile).
+- You can either run it [locally](#self-hosting) for yourself or host it [publicly](#cloud-hosting).
+- This implementation redirects almost all requests for static content to an IPFS-Gateway, in order to offload itself.
+
+- This implementation doesn't support HTTP/2. It prefers HTTP/1.1 but can't support persistent connections 🥺. To enable HTTP2 and persistent connections, however, you can simply put a capable reverse-proxy in front 🤓. If you choose to use [Caddy](https://caddyserver.com/) for this job, which helps with automatic HTTPS too btw, this project repository contains a ready [Caddyfile](/Caddyfile).
+- This implementation is optimized to save as much bandwidth as possible. While idle, viz. serving no requests, the IPFS node at the backend is paused with a SIGSTOP to stop it from consuming bandwidth.
+
+**HELP WANTED**: Port the codebase to Go, JS, Python etc. - anything speedier than Bash 😝. [Get in touch](https://github.com/ipns-link/contribute#join-the-community) if you're interested.
 
 ## Table of Contents  
 [![tocgen](https://img.shields.io/badge/Generated%20using-tocgen-blue)](https://github.com/SomajitDey/tocgen)  
   - [IPNS-Link-gateway](#ipns-link-gateway)  
       - [Self-hosting](#self-hosting)  
           - [Customize](#customize)  
+          - [IPFS Companion](#ipfs-companion)  
       - [Cloud-hosting](#cloud-hosting)  
+          - [General notes](#general-notes)  
+          - [Prerequisites](#prerequisites)  
           - [Heroku](#heroku)  
           - [EC2 (AWS)](#ec2-aws)  
       - [Acknowledgements](#acknowledgements)  
@@ -41,7 +50,7 @@ This implementation doesn't support HTTP/2. It prefers HTTP/1.1 but can't suppor
 
 4. Note the PID shown. To stop the server later just do `kill "PID"`
 
-5. Open http://www.localhost:8080 at any browser
+5. Open http://www.localhost:8080 in any browser
 
 ##### Customize
 
@@ -51,9 +60,45 @@ See available command-line options with:
 ./ipns-link-gateway -h
 ```
 
+##### IPFS Companion
+
+If you have [IPFS Companion](https://github.com/ipfs/ipfs-companion) running, you can integrate this gateway with it as follows.
+
+1. Run an IPFS node and thus a local IPFS Gateway at say `localhost:8080`. This is to serve static content.
+
+2. Point your IPNS-Link-gateway to this local IPFS-Gateway as :
+
+   ```bash
+   export IPFS_SUBD_GW="http://localhost:8080" IPFS_PATH_GW="http://localhost:8080"
+   ```
+
+3. Launch your IPNS-Link-gateway at say port 8000. This is to serve dynamic content.
+
+   ```bash
+   ./ipns-link-gateway -p 8000
+   ```
+
+4. Point your IPFS Companion to http://localhost:8000 as the local gateway and activate the use of subdomains.
+
+5. To browse an IPNS-Link-exposed site now, you just simply access the URI: `ipns://IPNSNameOfTheSite`
+
 ### Cloud-hosting
 
-Suppose your gateway is to have the URL: `https://domain.tld`. So, first of all, purchase the domain and familiarize yourself with the DNS manager console of your domain registrar / DNS provider. Create and store an API token for your DNS provider.
+Suppose your gateway is to have the URL: `https://domain.tld`. Just follow the [prerequisites](#prerequisites) and then carry on with your cloud setup and deployment. We provide guides for [Heroku](#heroku) and [AWS](#ec2-aws) only.
+
+##### General notes
+
+**Known issue**: You might experience some OOM (out-of-memory) related outage from time to time. Periodic restarts can avoid this for now. Hopefully this will be fixed soon.
+
+**Blocking offensive content**: If you receive any request to block specific sites from being accessed using your public gateway please [let us know](https://github.com/ipns-link/gateway-registry).
+
+##### Prerequisites
+
+1. Purchase the domain and familiarize yourself with the DNS manager console of your domain registrar / DNS provider. Create and store an API token for your DNS provider.
+2. Set up an email id with your purchased domain: `contact@domain.tld`. You might use a free email-forwarding service such as https://improvmx.com/ for this step. Also see https://improvmx.com/guides/send-emails-using-gmail/.
+3. Setup your own [payment gateway](https://www.buymeacoffee.com/).
+4. Edit the [index.html](/index.html) as instructed therein.
+5. Create an issue at the [official public-gateway-registry](https://github.com/ipns-link/gateway-registry) to let us know of your gateway.
 
 ##### Heroku
 
@@ -128,7 +173,7 @@ The following uses EC2 which is free for 1 year only with 750 hours/month. If yo
     git clone https://github.com/ipns-link/ipns-link-gateway; cd ipns-link-gateway
     ```
 
-16. Install the dependencies. The Heroku buildpack can actually help you here 😉
+16. Install the dependencies. The [Heroku buildpack](https://devcenter.heroku.com/articles/buildpacks) within this repository can help you here 😉
 
     ```bash
     bin/compile

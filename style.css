@@ -107,17 +107,14 @@ img {
 	left: 0;
 	width: 100%;
 	height: 80px;
-	background-color: #545658c2;
+	background-color: #545658de;
 	text-align: center;
 }
 
 .footer-text-center {
 	font-size: 25px;
-	padding-left: 40px;
-	align-content: center;
 }
 
 a.menu:hover {
-	background-color: yellow;
 	font-size: 20px;
 }

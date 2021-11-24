@@ -26,6 +26,12 @@
 	}
 }
 
+# Enable HTTPS for DNSLinked hostnames that are CNAMEd to our Gateway.
+# `DNSLinks` is a comma-separated list of such hostnames
+{$DNSLinks} {
+	import reverse_proxy
+}
+
 # Catch-all http to serve DNSLinked hostnames that are CNAMEd to our Gateway. Test with localtest.me
 http:// {
 	import reverse_proxy

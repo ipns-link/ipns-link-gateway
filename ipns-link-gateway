@@ -244,7 +244,8 @@ serve(){
   # Brief: Serve resource/webpage at the given path
   # Usage: serve [<path> | <(cmd) | <named-pipe>]
   [[ "${method}" == @(GET|HEAD) ]] || error 405 "Method Not Allowed"
-  local page="${1:-index.html}"; page="${page##*/}" # Makes sure only pages from within repo are served
+  local page="${1%\?}";
+  local page="${page:-index.html}"; page="${page##*/}" # Makes sure only pages from within repo are served
   [[ -f "${page}" ]] || error
   printf "%s\r\n" "HTTP/1.1 200 OK"
   printf "Connection: %s\r\n" "close"
@@ -307,7 +308,7 @@ forward(){
     if on_fail="$(key_val on_fail ${peerID})"; then
       redirect "${on_fail}"
     else
-      error 502 "Bad Gateway"
+      error 504 "Gateway Timeout"
     fi
   dl_ipfs_cache_struct "${cache_cid}" & # TODO: Fix. In bg doesn't pause ipfs when done.
 

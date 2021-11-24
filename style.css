@@ -91,7 +91,20 @@ img {
 	border-radius: 10px;
 	width: 140px;
 	height: 30px;
-	background-color: red;
+	background-color: blue;
+	font-weight: bold;
+	padding: 1px 0px;
+	font-size: 20px;
+}
+
+.help-needed-tag {
+	display: inline-block;
+	color: red;
+	border: 2px solid black;
+	border-radius: 10px;
+	width: 140px;
+	height: 30px;
+	background-color: yellow;
 	font-weight: bold;
 	padding: 1px 0px;
 	font-size: 20px;

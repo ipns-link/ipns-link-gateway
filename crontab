@@ -2,14 +2,27 @@
 # Brief: Automates update and (re)start of ipns-link-gateway. Logs at cron.log and caddy.log within the repo.
 #  This script may be executed as cron job on every reboot.
 #  Crontab: sudo crontab -e
-#    SHELL=/path/to/bash 
-#    @reboot sudo path/to/this/script
-#    0 * * * * sudo path/to/this/script
+#    @reboot sudo /absolute/path/to/this/script
+#    0 * * * * sudo /absolute/path/to/this/script
 # Note: Root priviledge is required to make caddy bind to lower ports 80 and 443
 
-export PASSWORD= # Put your chosen password here
-export DOMAIN= # Put your Gateway's domain name here
-export GW_REPO= # Put path to your git-cloned IPNS-Link-Gateway repository here
+####################### Edit Me ###################################
+
+# Put your DNS provider here. E.g. "cloudflare"
+export DNS_PROV=
+# Put your chosen password. Only alphanumeric characters allowed
+export PASSWORD=
+# Put your Gateway's domain name
+export DOMAIN=
+# Put absolute path to your git-cloned IPNS-Link-Gateway repository
+export GW_REPO=
+# Put API token from your DNS provider for editing DNS records
+export API_TKN=
+# Comma-separated list of DNSLinks that are CNAMEd to your gateway. E.g. "a.tld, b.tld"
+export DNSLinks=
+
+####################### Edit No Further ############################
+
 export logfile="${GW_REPO}"/cron.log
 
 log(){

@@ -1,3 +1,10 @@
+# This Caddyfile is configured to revere proxy https requests to an IPNS-Link-gateway.
+# GW_ADDRS contains gateway address (IP:port)
+# DOMAIN contains chosen domain name, the gateway is exposed with
+# DNS_PROV contains name of the DNS provider
+# API_TKN contains API token from the DNS provider with permission to edit DNS records
+# DNSLinks contains comma separated list of DNSLinks CNAMEd to the gateway domain.
+
 #{
 #    acme_dns {$DNS_PROV:cloudflare} {$API_TKN}
 #}

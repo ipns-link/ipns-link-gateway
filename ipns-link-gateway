@@ -28,7 +28,7 @@ Example: ipns-link-gateway -a \$PASSWORD -p \$PORT \$URL
 " 
 } >&2; export -f usage
 
-export version=1.0.5
+export version=1.0.6
 export IPFS_PATH="${PWD}/.ipfs"
 export cache_dir="${IPFS_PATH}/.cache"
 export GNUPGHOME="${IPFS_PATH}/.gpg"
@@ -274,8 +274,8 @@ forward(){
   # Usage: forward <peerID | dnslink>
   
   # Handle content-addressed IPFS or IPNS paths
-  [[ "${method}" == GET ]] && [[ "${path}" =~ ^/ipfs/* ]] && redirect "${ipfs_subd_gw}${path}"
-  [[ "${path}" =~ ^/ipns/* ]] && redirect "${gateway_url}${path}"
+  [[ "${method}" == GET ]] && [[ "${path}" =~ ^/ipfs/.* ]] && redirect "${ipfs_subd_gw}${path}"
+  [[ "${path}" =~ ^/ipns/.* ]] && redirect "${gateway_url}${path}"
 
   # Handle failure to download/decrypt Manifest and DNSLinks that resolve to IPFS paths
   local peerID="$(b36_peerID "${1}")" trusted_gw
@@ -351,7 +351,7 @@ handler(){
       local fwd_path="${BASH_REMATCH[3]//${BASH_REMATCH[4]}/\/}"
       [[ -n "${peerID}" ]] || redirect "${ipfs_subd_gw}/ipns/${BASH_REMATCH[2]}${fwd_path}" 303 "See Other"
       redirect "${proto}://${peerID}.ipns.${gateway_host}${port}${fwd_path}"
-    elif [[ "${path}" =~ ^/ipfs/* ]]; then
+    elif [[ "${path}" =~ ^/ipfs/.* ]]; then
       redirect "${ipfs_subd_gw}${path}" 303 "See Other"
     else
       serve "${path#/}"
@@ -494,6 +494,7 @@ pre_flight(){
 
 main(){
   # Brief: The main driver
+  pre_flight
   export gateway_port=8080 max_conns=500 req_per_min=200 password=admin block=false # Defaults
   local OPTIND=1 opt
   while getopts c:p:u:m:r:a:vUhb opt; do
@@ -506,7 +507,7 @@ main(){
       a) password="${OPTARG}"
         [[ "${password}" =~ ^[[:alnum:]]*$ ]] || { echo "Error: Only alphanumeric password" >&2; exit;};;
       v) echo "${version}"; exit;;
-      U) report_updates && git pull; exit $?;;
+      U) git pull; exit $?;;
       b) block=true ;; # Blocking mode, opposed to background daemon mode. Required for Heroku for example
       h | *) usage; exit 1;;
     esac
@@ -530,7 +531,6 @@ main(){
     export bind_addrs="UNIX-LISTEN:${unix_socket}"
   fi
 
-  pre_flight
   flock -n index.html -c : || { echo "Error: Another instance running" >&2; exit 1;}
   socat -T 0.1 TCP:127.0.0.1:"${gateway_port}" FILE:/dev/null &>/dev/null && \
     { echo "Error: Port ${gateway_port} already in use" >&2; exit 1;}

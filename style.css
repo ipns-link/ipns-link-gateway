@@ -22,6 +22,16 @@ a:hover {
 	text-decoration: underline;
 }
 
+.btw-text {
+	color: rgb(65, 65, 65);
+	font-size: 16px;
+	font-style: italic;
+}
+
+.underlined {
+	text-decoration: underline;
+}
+
 .heading {
 	text-align: center;
 	font-weight: bolder;
@@ -35,6 +45,11 @@ img {
 	vertical-align: -25px;
 }
 
+.qr {
+	width: 200px;
+	height: 200px;
+}
+
 .main-header {
 	display: inline-block;
 	font-size: 60px;
@@ -43,6 +58,7 @@ img {
 
 .sub-header {
 	font-size: 30px;
+	color: #1a5557;
 }
 
 .search {
@@ -91,20 +107,7 @@ img {
 	border-radius: 10px;
 	width: 140px;
 	height: 30px;
-	background-color: blue;
-	font-weight: bold;
-	padding: 1px 0px;
-	font-size: 20px;
-}
-
-.help-needed-tag {
-	display: inline-block;
-	color: red;
-	border: 2px solid black;
-	border-radius: 10px;
-	width: 140px;
-	height: 30px;
-	background-color: yellow;
+	background-color: red;
 	font-weight: bold;
 	padding: 1px 0px;
 	font-size: 20px;

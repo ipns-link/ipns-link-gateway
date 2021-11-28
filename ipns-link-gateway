@@ -1,6 +1,6 @@
 #!/usr/bin/env -S bash -O extglob
 export LANGUAGE=C LANG=C LC_ALL=C
-export PATH=bin:"${HOME}"/.bin:"${PATH}"
+export PATH="${PATH}":"${HOME}"/.bin:bin
 export TIMEOUT=0 # Helps with: f(){ timeout ${TIMEOUT} cmd;} invoked as `TIMEOUT=<seconds> f`
 
 usage(){
@@ -28,7 +28,7 @@ Example: ipns-link-gateway -a \$PASSWORD -p \$PORT \$URL
 " 
 } >&2; export -f usage
 
-export version=1.0.6
+export version=1.0.7
 export IPFS_PATH="${PWD}/.ipfs"
 export cache_dir="${IPFS_PATH}/.cache"
 export GNUPGHOME="${IPFS_PATH}/.gpg"
@@ -365,7 +365,7 @@ handler(){
     redirect "${ipfs_subd_gw}/ipfs/${BASH_REMATCH[1]}${path}" 303 "See Other"
   elif [[ "${host}" =~ ^[[:digit:].]+$ ]]; then
     # Ignore / serve index.html to requests with (the current) public IP as the hostname
-    serve
+    serve "${path#/}"
   elif [[ "${host}" =~ ^[-[:alnum:].]+$ ]]; then
     forward "${host}"
   else

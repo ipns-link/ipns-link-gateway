@@ -24,7 +24,7 @@ a:hover {
 
 .btw-text {
 	color: rgb(65, 65, 65);
-	font-size: 16px;
+	font-size: 35px;
 	font-style: italic;
 }
 
@@ -43,11 +43,6 @@ img {
 	width: 90px;
 	height: 90px;
 	vertical-align: -25px;
-}
-
-.qr {
-	width: 200px;
-	height: 200px;
 }
 
 .main-header {

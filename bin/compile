@@ -12,10 +12,10 @@ if ! [[ -f "${cached_ipfs}" ]]; then
     cd "${cache_dir}"
     echo "-----> Downloading jq v1.6"
     wget https://github.com/stedolan/jq/releases/download/jq-1.6/jq-linux64 || exit $?
-    echo "-----> Downloading go-ipfs v0.10.0"
-    wget https://dist.ipfs.io/go-ipfs/v0.10.0/go-ipfs_v0.10.0_linux-amd64.tar.gz || exit $?
+    echo "-----> Downloading go-ipfs v0.11.0"
+    wget https://dist.ipfs.io/go-ipfs/v0.11.0/go-ipfs_v0.11.0_linux-amd64.tar.gz || exit $?
     echo "-----> Extracting ..."
-    tar -xzf go-ipfs_v0.10.0_linux-amd64.tar.gz
+    tar -xzf go-ipfs_v0.11.0_linux-amd64.tar.gz
   )
 fi
 
@@ -27,4 +27,4 @@ git init || exit 1 # Initialize git repo in the build_dir in case git is require
 cp "${cache_dir}/jq-linux64" bin/jq && chmod +x bin/jq && \
   echo "-----> Installed jq v1.6" || exit 1
 cp "${cached_ipfs}" bin/ipfs && chmod +x bin/ipfs && \
-  echo "-----> Installed go-ipfs v0.10.0" || exit 1
+  echo "-----> Installed go-ipfs v0.11.0" || exit 1

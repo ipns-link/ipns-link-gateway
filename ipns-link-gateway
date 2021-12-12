@@ -28,7 +28,7 @@ Example: ipns-link-gateway -a \$PASSWORD -p \$PORT \$URL
 " 
 } >&2; export -f usage
 
-export version=1.0.7
+export version=1.0.8
 export IPFS_PATH="${PWD}/.ipfs"
 export cache_dir="${IPFS_PATH}/.cache"
 export GNUPGHOME="${IPFS_PATH}/.gpg"
@@ -387,8 +387,10 @@ init(){
     ipfs config --json Swarm.ConnMgr.LowWater 0
     ipfs config --json Swarm.ConnMgr.HighWater 2
     ipfs config --bool Swarm.EnableRelayHop false
+    ipfs config --bool Swarm.RelayService.Enabled false # Can't act as relay when node sleeps.
     ipfs config --bool Swarm.DisableNatPortMap true
     ipfs config --bool Swarm.EnableAutoRelay false
+    ipfs config --bool Swarm.RelayClient.Enabled false
     ipfs config AutoNAT.ServiceMode disabled
     # Ref: https://docs.ipfs.io/how-to/peering-with-content-providers/#content-provider-list
     ipfs config --json Peering.Peers '[
@@ -431,6 +433,9 @@ EOF
   fi
   ipfs config profile apply randomports; rm -f "${IPFS_PATH}/config-pre-"*
   (ipfs swarm peers || rm -f "${sockets}"/*) # Otherwise API and Gateway won't bind to existing UNIX socket
+  # Download blacklist. We could use DNSLink + IPFS for this, but it might be too slow
+  local URL=https://raw.githubusercontent.com/ipns-link/gateway-registry/main/blocked.md
+  curl -sfL "${URL}" | grep -v '^#' | tr -d '\r' | awk 'NF {print $1}' > "${blacklist_file}"
   # TODO: Handle SIGHUP on `main` exit better.
   # Without the following `setsid`, `ipfs daemon` surprisingly exits with SIGHUP, even with `nohup`, when `main` exits
   # The `setsid`, thanks to its own subshell, doesn't fork and `exec`s into ipfs daemon. Hence they have same pid.
@@ -487,14 +492,10 @@ pre_flight(){
     { echo "Must be run from the original git-repo that you git-cloned" >&2; exit 1;}
   dep_check
   report_updates
-  # Download blacklist. We could use DNSLink + IPFS for this, but it might be too slow
-  local URL=https://raw.githubusercontent.com/ipns-link/gateway-registry/main/blocked.md
-  curl -sfL "${URL}" | grep -v '^#' | tr -d '\r' | awk 'NF {print $1}' > "${blacklist_file}"
 }
 
 main(){
   # Brief: The main driver
-  pre_flight
   export gateway_port=8080 max_conns=500 req_per_min=200 password=admin block=false # Defaults
   local OPTIND=1 opt
   while getopts c:p:u:m:r:a:vUhb opt; do
@@ -512,6 +513,7 @@ main(){
       h | *) usage; exit 1;;
     esac
   done
+  pre_flight
   local arg="${!OPTIND:-"http://localhost:${gateway_port:-8080}"}"
   if [[ "${arg}" =~ ^(http|https)://([-[:alnum:].]+)(:[[:digit:]]+)?$ ]]; then
     export gateway_url="${arg}"

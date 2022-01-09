@@ -104,7 +104,7 @@ If you have [IPFS Companion](https://github.com/ipfs/ipfs-companion) running, yo
 2. Generate an API token for programatically editing your DNS records.
 3. Test if gateway is running locally. This makes sure you've all the dependencies in place. Once tested, kill the gateway using its PID.
 4. Open ports 443 (HTTPS) and 80 (HTTP) for incoming traffic.
-5. Install [Caddy](https://caddyserver.com/download) for Linux amd64, custom built with your DNS provider's plugin. For example's sake, we shall assume your DNS provider is CloudFlare. **Tip**: Download the binary with `curl -Lo caddy $URL` instead of `wget`. Then,`chmod +x caddy ; sudo install caddy /usr/local/bin`
+5. Install [Caddy](https://caddyserver.com/download) for Linux amd64, custom built with your DNS provider's plugin. For example's sake, we shall assume your DNS provider is CloudFlare. **Tip**: Download the binary with `curl -Lo caddy "URL TO DOWNLOAD"` instead of `wget`. Then,`chmod +x caddy` and `sudo install caddy /usr/local/bin`
 6. Edit the [crontab file](/crontab) within this repo by putting appropriate values for all the environment variables
 7. Set up a cronjob for root as instructed in the crontab file.
 8. Launch the script : `sudo /path/to/edited/crontab/file`. This would launch the gateway and caddy with progress logged in `cron.log` and `caddy.log` within the repo.
@@ -132,7 +132,7 @@ If you have [IPFS Companion](https://github.com/ipfs/ipfs-companion) running, yo
 If you're hosting a public gateway, please note these.
 
 1. Set up an email id with your purchased domain: `contact@domain.tld`. You might use a free email-forwarding service such as https://improvmx.com/ for this step. Also see https://improvmx.com/guides/send-emails-using-gmail/.
-2. Setup your own [payment portal](https://www.buymeacoffee.com/).
+2. Setup your own [payment portal](https://www.buymeacoffee.com/) or get a crypto wallet.
 3. Edit the html files to reflect your contact details and payment portals.
 4. Create an issue at the [official public-gateway-registry](https://github.com/ipns-link/gateway-registry) to let us know of your gateway.
 5. If you receive any request to block specific sites from being accessed using your public gateway please [let us know](https://github.com/ipns-link/gateway-registry).
@@ -155,4 +155,4 @@ We cannot sustain this project and our public gateways without your support.
 [![Donate](https://img.shields.io/badge/Donate%20to-IPNS--Link-brightgreen)](https://github.com/ipns-link/contribute/blob/main/donate.md)
 
 
-
+
